@@ -62,7 +62,7 @@ except ImportError:
     HAS_ADI = False
     print("Warning: pyadi-iio not available. Running in simulation mode.")
 
-from vita49_packets import (
+from .packets import (
     VRTSignalDataPacket,
     VRTContextPacket,
     VRTTimestamp,
