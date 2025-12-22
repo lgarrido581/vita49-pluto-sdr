@@ -12,6 +12,5 @@ cat vita49_streamer | ssh root@pluto.local "cat > vita49_streamer"
 # Run commands on the Pluto
 ssh -tt root@pluto.local << 'EOF'
 chmod 777 vita49_streamer
-./vita49_streamer &
-exit
+./vita49_streamer
 EOF
