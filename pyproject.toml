@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vita49-pluto"
+version = "1.0.0"
+description = "VITA49 streaming for ADALM-Pluto SDR"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "VITA49 Pluto Contributors"}
+]
+requires-python = ">=3.7"
+dependencies = [
+    "numpy>=1.20.0",
+    "pyadi-iio>=0.0.14",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.optional-dependencies]
+examples = [
+    "matplotlib>=3.3.0",
+    "scipy>=1.7.0",
+]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/vita49-pluto"
+Documentation = "https://github.com/yourusername/vita49-pluto/tree/main/docs"
+Repository = "https://github.com/yourusername/vita49-pluto"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v"

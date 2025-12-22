@@ -1,0 +1,8 @@
+# Pluto SDR Requirements (minimal)
+# For running Python streamer on Pluto device
+
+# Required for Python streamers
+pyadi-iio>=0.0.14
+
+# Note: C streamer (recommended) requires only libiio (already on Pluto)
+# numpy only needed for embedded.py, not standalone.py

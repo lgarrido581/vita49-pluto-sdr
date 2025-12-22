@@ -1,0 +1,10 @@
+# VITA49 Pluto Host Requirements
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.20.0
+pyadi-iio>=0.0.14
+
+# Optional - for plotting examples
+matplotlib>=3.3.0
+scipy>=1.7.0
