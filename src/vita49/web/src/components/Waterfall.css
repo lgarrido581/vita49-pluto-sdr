@@ -1,0 +1,12 @@
+.waterfall {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 300px;
+}
+
+.info-text {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  font-family: 'Fira Code', monospace;
+}
