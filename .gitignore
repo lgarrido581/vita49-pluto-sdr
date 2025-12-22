@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+lastfailed
+nodeids
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+vita49_streamer
+*.o
+*.exe
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Mount points and temporary directories
+mnt/
+
+# Cache
+CACHEDIR.TAG

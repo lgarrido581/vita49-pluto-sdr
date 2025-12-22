@@ -1,0 +1,48 @@
+# VITA 49 Streaming Service for Pluto+
+#
+# This systemd service file enables automatic VITA 49 streaming
+# when the Pluto+ boots up.
+#
+# Installation:
+#   1. Copy to Pluto+:
+#      scp vita49.service root@pluto.local:/etc/systemd/system/
+#
+#   2. Edit destination IP in /root/vita49/start_streaming.sh
+#
+#   3. Enable and start:
+#      ssh root@pluto.local
+#      systemctl daemon-reload
+#      systemctl enable vita49
+#      systemctl start vita49
+#
+#   4. Check status:
+#      systemctl status vita49
+#      journalctl -u vita49 -f
+#
+# To disable auto-start:
+#      systemctl disable vita49
+#
+
+[Unit]
+Description=VITA 49 IQ Streaming Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/root/vita49/start_streaming.sh
+WorkingDirectory=/root/vita49
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits for embedded environment
+MemoryMax=64M
+CPUQuota=80%
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
