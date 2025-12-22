@@ -35,7 +35,7 @@ Skip this for production use - just use the built static files.
 
 **Terminal 1 - Start Backend**:
 ```bash
-python -m vita49.web_server --host 0.0.0.0 --port 8000 --auto-start
+python -m vita49.web_server --host 0.0.0.0 --port 8001 --auto-start
 ```
 
 **Terminal 2 - Start Frontend**:
@@ -56,10 +56,10 @@ npm run build
 
 2. Start backend:
 ```bash
-python -m vita49.web_server --host 0.0.0.0 --port 8000
+python -m vita49.web_server --host 0.0.0.0 --port 8001
 ```
 
-**Access**: http://localhost:8000
+**Access**: http://localhost:8001
 
 ## Using the Web UI
 
@@ -90,14 +90,14 @@ Click these in the Control Panel for instant setup:
 ## Troubleshooting
 
 ### "Cannot connect to WebSocket"
-- Ensure backend is running on port 8000
+- Ensure backend is running on port 8001
 - Check firewall settings
 
 ### "No data in plots"
 - Click "Start Stream" button
 - Verify Pluto is streaming: `ssh root@pluto.local 'ps | grep vita49'`
 
-### "Port 8000 already in use"
+### "Port 8001 already in use"
 - Use different port: `python -m vita49.web_server --port 8080`
 
 ## Access from Other Devices
@@ -106,7 +106,7 @@ To access from phone/tablet on same network:
 
 1. Find your PC's IP address: `ipconfig` (Windows) or `ifconfig` (Linux)
 2. Start backend: `python -m vita49.web_server --host 0.0.0.0`
-3. Access from other device: http://YOUR_PC_IP:8000
+3. Access from other device: http://YOUR_PC_IP:8001
 
 ## Next Steps
 

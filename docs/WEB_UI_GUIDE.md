@@ -37,7 +37,7 @@ The VITA49 Pluto Web UI provides a modern, browser-based interface for:
 ┌──────────────────────┐
 │   Backend Server     │
 │   (FastAPI/Python)   │
-│   - Port 8000        │
+│   - Port 8001        │
 └──────────────────────┘
          │ UDP VITA49
          ▼
@@ -63,7 +63,7 @@ The VITA49 Pluto Web UI provides a modern, browser-based interface for:
 
 ### Network
 - Pluto accessible at ip:192.168.2.1 (or custom URI)
-- Port 8000 available for web server
+- Port 8001 available for web server
 - Port 4991 available for VITA49 UDP stream
 
 ## Installation
@@ -118,7 +118,7 @@ Best for development and testing. Runs frontend dev server with hot reload.
 **Terminal 1 - Backend**:
 ```bash
 cd C:\git-repos\vita49-pluto
-python -m vita49.web_server --host 0.0.0.0 --port 8000 --auto-start
+python -m vita49.web_server --host 0.0.0.0 --port 8001 --auto-start
 ```
 
 **Terminal 2 - Frontend**:
@@ -142,10 +142,10 @@ npm run build
 2. Start the backend:
 ```bash
 cd C:\git-repos\vita49-pluto
-python -m vita49.web_server --host 0.0.0.0 --port 8000 --auto-start
+python -m vita49.web_server --host 0.0.0.0 --port 8001 --auto-start
 ```
 
-**Access**: http://localhost:8000
+**Access**: http://localhost:8001
 
 ### Option 3: Quick Demo (No Frontend Build)
 
@@ -155,7 +155,7 @@ Use the built-in API for basic testing:
 python -m vita49.web_server --auto-start
 ```
 
-**Access API**: http://localhost:8000/api/status
+**Access API**: http://localhost:8001/api/status
 
 ## Features
 
@@ -238,7 +238,7 @@ Use the REST API from other applications:
 import requests
 
 # Get status
-status = requests.get('http://localhost:8000/api/status').json()
+status = requests.get('http://localhost:8001/api/status').json()
 
 # Configure Pluto
 config = {
@@ -248,10 +248,10 @@ config = {
     'bandwidth_hz': 20e6,
     'rx_gain_db': 30.0
 }
-requests.post('http://localhost:8000/api/config', json=config)
+requests.post('http://localhost:8001/api/config', json=config)
 
 # Start stream
-requests.post('http://localhost:8000/api/stream/start')
+requests.post('http://localhost:8001/api/stream/start')
 ```
 
 ### WebSocket Client
@@ -259,7 +259,7 @@ requests.post('http://localhost:8000/api/stream/start')
 Connect from JavaScript or Python:
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8000/ws/stream')
+const ws = new WebSocket('ws://localhost:8001/ws/stream')
 
 ws.onmessage = (event) => {
   const message = JSON.parse(event.data)
@@ -287,21 +287,21 @@ Or configure via the web UI control panel.
 Allow access from other devices on your network:
 
 ```bash
-python -m vita49.web_server --host 0.0.0.0 --port 8000
+python -m vita49.web_server --host 0.0.0.0 --port 8001
 ```
 
-Access from other devices: http://YOUR_PC_IP:8000
+Access from other devices: http://YOUR_PC_IP:8001
 
 ### Firewall Configuration
 
 **Windows**:
 ```powershell
-netsh advfirewall firewall add rule name="VITA49 Web UI" dir=in action=allow protocol=TCP localport=8000
+netsh advfirewall firewall add rule name="VITA49 Web UI" dir=in action=allow protocol=TCP localport=8001
 ```
 
 **Linux**:
 ```bash
-sudo ufw allow 8000/tcp
+sudo ufw allow 8001/tcp
 ```
 
 ### Run as Service (Linux)
@@ -321,7 +321,7 @@ After=network.target
 Type=simple
 User=your_username
 WorkingDirectory=/path/to/vita49-pluto
-ExecStart=/usr/bin/python3 -m vita49.web_server --host 0.0.0.0 --port 8000 --auto-start
+ExecStart=/usr/bin/python3 -m vita49.web_server --host 0.0.0.0 --port 8001 --auto-start
 Restart=always
 
 [Install]
@@ -343,7 +343,7 @@ A Dockerfile will be provided for containerized deployment.
 ### Backend Won't Start
 
 **Error**: "Address already in use"
-- Solution: Port 8000 is taken. Use a different port:
+- Solution: Port 8001 is taken. Use a different port:
   ```bash
   python -m vita49.web_server --port 8080
   ```
@@ -378,7 +378,7 @@ A Dockerfile will be provided for containerized deployment.
 **Symptom**: Red "Disconnected" indicator in header
 
 1. Check backend is running
-2. Verify URL is correct (ws://localhost:8000/ws/stream)
+2. Verify URL is correct (ws://localhost:8001/ws/stream)
 3. Clear browser cache and reload
 4. Check browser console for errors (F12)
 

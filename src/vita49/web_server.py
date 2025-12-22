@@ -538,8 +538,8 @@ def main():
     parser.add_argument(
         '--port', '-p',
         type=int,
-        default=8000,
-        help="Web server port (default: 8000)"
+        default=8001,
+        help="Web server port (default: 8001)"
     )
     parser.add_argument(
         '--vita49-port',

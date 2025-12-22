@@ -16,7 +16,7 @@ function App() {
   const [statistics, setStatistics] = useState(null)
 
   // WebSocket connection
-  const wsUrl = `ws://${window.location.hostname}:8000/ws/stream`
+  const wsUrl = `ws://${window.location.hostname}:8001/ws/stream`
   const ws = useWebSocket(wsUrl)
 
   // Register WebSocket message handlers

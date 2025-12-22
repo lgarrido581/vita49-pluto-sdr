@@ -160,7 +160,7 @@ npm install
 ### 2. Start Backend
 
 ```bash
-python -m vita49.web_server --host 0.0.0.0 --port 8000 --auto-start
+python -m vita49.web_server --host 0.0.0.0 --port 8001 --auto-start
 ```
 
 ### 3. Start Frontend (Development)
@@ -197,7 +197,7 @@ Open browser to: http://localhost:3000
 
 ```
 1. User opens browser → React app loads
-2. App connects to WebSocket (ws://localhost:8000/ws/stream)
+2. App connects to WebSocket (ws://localhost:8001/ws/stream)
 3. Backend starts VITA49StreamClient listening on UDP 4991
 4. Pluto streams VITA49 packets → Backend receives
 5. Backend computes FFT → Sends to WebSocket
@@ -254,7 +254,7 @@ User's Browser
 
 - [ ] Install backend dependencies
 - [ ] Start backend server
-- [ ] Verify API responds at http://localhost:8000/api/status
+- [ ] Verify API responds at http://localhost:8001/api/status
 - [ ] Install frontend dependencies
 - [ ] Start frontend dev server
 - [ ] Verify WebSocket connection (green indicator)

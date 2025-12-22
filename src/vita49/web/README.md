@@ -75,13 +75,13 @@ pip install fastapi uvicorn websockets
 
 2. Start the backend server:
 ```bash
-python -m vita49.web_server --host 0.0.0.0 --port 8000
+python -m vita49.web_server --host 0.0.0.0 --port 8001
 ```
 
 The backend will:
 - Listen for VITA49 UDP packets on port 4991
-- Serve REST API on port 8000
-- Provide WebSocket streaming on ws://localhost:8000/ws/stream
+- Serve REST API on port 8001
+- Provide WebSocket streaming on ws://localhost:8001/ws/stream
 
 ### Frontend Setup
 
@@ -191,7 +191,7 @@ Get recent packet history.
 
 ### WebSocket Messages
 
-Connect to `ws://localhost:8000/ws/stream`
+Connect to `ws://localhost:8001/ws/stream`
 
 **Incoming Message Types**:
 
@@ -254,10 +254,10 @@ app.mount("/", StaticFiles(directory="src/vita49/web/dist", html=True), name="st
 
 3. Run the production server:
 ```bash
-python -m vita49.web_server --host 0.0.0.0 --port 8000
+python -m vita49.web_server --host 0.0.0.0 --port 8001
 ```
 
-Access the application at: http://localhost:8000
+Access the application at: http://localhost:8001
 
 ## Development
 
@@ -308,7 +308,7 @@ src/vita49/web/
 
 ### WebSocket Connection Failed
 
-- Ensure backend is running on port 8000
+- Ensure backend is running on port 8001
 - Check firewall settings
 - Verify CORS configuration in `web_server.py`
 
