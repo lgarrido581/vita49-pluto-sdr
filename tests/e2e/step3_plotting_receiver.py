@@ -23,8 +23,8 @@ from matplotlib.animation import FuncAnimation
 from collections import deque
 import time
 
-from vita49_stream_server import VITA49StreamClient
-from vita49_packets import VRTSignalDataPacket
+from vita49.stream_server import VITA49StreamClient
+from vita49.packets import VRTSignalDataPacket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,7 +145,7 @@ class VITA49PlottingReceiver:
     def _on_context_received(self, context_data: bytes):
         """Callback for received VITA49 context packets"""
         try:
-            from vita49_packets import VRTContextPacket
+            from vita49.packets import VRTContextPacket
 
             # Decode context packet
             context = VRTContextPacket.decode(context_data)
