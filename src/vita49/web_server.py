@@ -31,6 +31,7 @@ import uvicorn
 
 from .stream_server import VITA49StreamClient
 from .packets import VRTSignalDataPacket, VRTContextPacket
+from .config_client import VITA49ConfigClient
 
 # Configure logging
 logging.basicConfig(
@@ -121,6 +122,7 @@ class VITA49WebHandler:
         self.manager = connection_manager
         self.client: Optional[VITA49StreamClient] = None
         self.running = False
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Stream configuration
         self.listen_port = 4991
@@ -164,6 +166,13 @@ class VITA49WebHandler:
         if self.running:
             logger.warning("Stream handler already running")
             return False
+
+        # Capture the current event loop for thread-safe task scheduling
+        try:
+            self._event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # If no running loop, try to get the event loop
+            self._event_loop = asyncio.get_event_loop()
 
         self.listen_port = port
         self.client = VITA49StreamClient(port=port)
@@ -209,11 +218,15 @@ class VITA49WebHandler:
             self.metadata['context_received'] = True
             self.stats['context_packets_received'] += 1
 
-            # Broadcast metadata update
-            asyncio.create_task(self.manager.broadcast({
-                'type': 'metadata',
-                'data': self.metadata
-            }))
+            # Broadcast metadata update (thread-safe)
+            if self._event_loop:
+                asyncio.run_coroutine_threadsafe(
+                    self.manager.broadcast({
+                        'type': 'metadata',
+                        'data': self.metadata
+                    }),
+                    self._event_loop
+                )
 
             logger.info(f"Context packet received: {self.metadata['center_freq_hz']/1e9:.3f} GHz, "
                        f"{self.metadata['sample_rate_hz']/1e6:.1f} MSPS")
@@ -244,14 +257,40 @@ class VITA49WebHandler:
             'stream_id': f"0x{packet.stream_id:08X}",
             'packet_count': packet.header.packet_count,
             'sample_count': len(samples),
-            'type': 'DATA'
+            'type': 'DATA',
+            'header': {
+                'packet_type': packet.header.packet_type.name,
+                'class_id_present': packet.header.class_id_present,
+                'trailer_present': packet.header.trailer_present,
+                'tsi': packet.header.tsi.name,
+                'tsf': packet.header.tsf.name,
+                'packet_size_words': packet.header.packet_size
+            },
+            'timestamp_detail': {
+                'integer_seconds': packet.timestamp.integer_seconds if packet.timestamp else None,
+                'fractional_seconds': packet.timestamp.fractional_seconds if packet.timestamp else None
+            } if packet.timestamp else None,
+            'trailer': {
+                'calibrated_time': packet.trailer.calibrated_time,
+                'valid_data': packet.trailer.valid_data,
+                'reference_lock': packet.trailer.reference_lock,
+                'agc_mgc': packet.trailer.agc_mgc,
+                'detected_signal': packet.trailer.detected_signal,
+                'spectral_inversion': packet.trailer.spectral_inversion,
+                'over_range': packet.trailer.over_range,
+                'sample_loss': packet.trailer.sample_loss
+            } if packet.trailer else None
         }
         self.packet_history.append(packet_info)
 
         # Process and broadcast if enough time has elapsed
         current_time = time.time()
         if current_time - self._last_broadcast_time >= self._broadcast_interval:
-            asyncio.create_task(self._process_and_broadcast())
+            if self._event_loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._process_and_broadcast(),
+                    self._event_loop
+                )
             self._last_broadcast_time = current_time
 
     async def _process_and_broadcast(self):
@@ -370,7 +409,7 @@ async def get_status():
     """Get current system status"""
     return JSONResponse({
         'streaming': handler.running,
-        'config': asdict(current_config) if current_config else None,
+        'config': current_config.dict() if current_config else None,
         'metadata': handler.get_metadata(),
         'statistics': handler.get_stats(),
         'clients_connected': len(manager.active_connections)
@@ -386,18 +425,35 @@ async def set_config(config: PlutoConfig):
         # Store configuration
         current_config = config
 
-        # In a real implementation, you would send a VITA49 context packet
-        # to the Pluto streamer to reconfigure it. For now, we'll just
-        # update our local state.
+        # Extract Pluto IP from URI (format: "ip:192.168.2.1")
+        pluto_ip = config.pluto_uri.replace("ip:", "").replace("usb:", "")
 
-        # TODO: Send configuration to Pluto via config_client logic
-        logger.info(f"Configuration updated: {config.center_freq_hz/1e9:.3f} GHz, "
+        # Send configuration to Pluto via VITA49 Context packet
+        client = VITA49ConfigClient(
+            pluto_ip=pluto_ip,
+            control_port=4990,
+            data_port=4991
+        )
+
+        success = client.configure(
+            sample_rate_hz=config.sample_rate_hz,
+            center_freq_hz=config.center_freq_hz,
+            bandwidth_hz=config.bandwidth_hz,
+            gain_db=config.rx_gain_db
+        )
+
+        client.close()
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to send configuration to Pluto")
+
+        logger.info(f"Configuration sent to Pluto: {config.center_freq_hz/1e9:.3f} GHz, "
                    f"{config.sample_rate_hz/1e6:.1f} MSPS, {config.rx_gain_db} dB")
 
         return JSONResponse({
             'success': True,
-            'message': 'Configuration updated',
-            'config': asdict(config)
+            'message': 'Configuration sent to Pluto',
+            'config': config.dict()
         })
 
     except Exception as e:
