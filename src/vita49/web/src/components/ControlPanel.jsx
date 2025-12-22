@@ -13,11 +13,13 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
 
   const [isStreaming, setIsStreaming] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const [configInitialized, setConfigInitialized] = useState(false)
 
   useEffect(() => {
     if (status) {
       setIsStreaming(status.streaming)
-      if (status.metadata && status.metadata.context_received) {
+      // Only update config from metadata on initial load, not on every status update
+      if (status.metadata && status.metadata.context_received && !configInitialized) {
         setConfig(prev => ({
           ...prev,
           center_freq_hz: status.metadata.center_freq_hz,
@@ -25,9 +27,10 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
           bandwidth_hz: status.metadata.bandwidth_hz,
           rx_gain_db: status.metadata.gain_db
         }))
+        setConfigInitialized(true)
       }
     }
-  }, [status])
+  }, [status, configInitialized])
 
   const handleChange = (field, value) => {
     setConfig(prev => ({ ...prev, [field]: value }))

@@ -141,13 +141,26 @@ class VRTClassID:
 
 @dataclass
 class VRTTimestamp:
-    """VRT Timestamp (up to 96 bits / 3 words)"""
-    integer_seconds: int = 0        # 32 bits - seconds since epoch
+    """
+    VRT Timestamp (up to 96 bits / 3 words)
+
+    For TSI=UTC (0b01): integer_seconds is seconds since POSIX epoch (Jan 1, 1970 00:00:00 UTC)
+    For TSI=GPS (0b10): integer_seconds is seconds since GPS epoch (Jan 6, 1980 00:00:00 UTC)
+
+    Note: This implementation assumes TSI=UTC and uses POSIX epoch throughout.
+    """
+    integer_seconds: int = 0        # 32 bits - seconds since epoch (POSIX for UTC, GPS for GPS)
     fractional_seconds: int = 0     # 64 bits - picoseconds or sample count
 
     @classmethod
     def from_time(cls, timestamp: float, sample_rate: float = 0) -> 'VRTTimestamp':
-        """Create timestamp from Python time (seconds since epoch)"""
+        """
+        Create timestamp from Python time (seconds since POSIX epoch)
+
+        Args:
+            timestamp: Python time.time() value (seconds since POSIX epoch Jan 1, 1970)
+            sample_rate: Not currently used, reserved for TSF=SAMPLE_COUNT mode
+        """
         int_sec = int(timestamp)
         frac_sec = timestamp - int_sec
         # Convert fractional seconds to picoseconds
@@ -156,11 +169,16 @@ class VRTTimestamp:
 
     @classmethod
     def now(cls) -> 'VRTTimestamp':
-        """Create timestamp for current time"""
+        """Create timestamp for current time (POSIX epoch)"""
         return cls.from_time(time.time())
 
     def to_time(self) -> float:
-        """Convert to Python time (seconds since epoch)"""
+        """
+        Convert to Python time (seconds since POSIX epoch)
+
+        Returns:
+            Float timestamp compatible with Python's time.time()
+        """
         return self.integer_seconds + (self.fractional_seconds / 1e12)
 
     def encode(self, tsi: TSI, tsf: TSF) -> bytes:
