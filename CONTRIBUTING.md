@@ -10,11 +10,19 @@ Thank you for your interest in contributing to the VITA49 Pluto project!
    cd vita49-pluto
    ```
 
-2. **Install dependencies**
+2. **Install the package in development mode**
    ```bash
-   pip install -r requirements.txt
-   pip install pytest pytest-cov  # For testing
+   # Install in editable mode with all dependencies
+   pip install -e .
+
+   # Or install with development/testing dependencies
+   pip install -e ".[dev]"
    ```
+
+   This installs the `vita49` package in editable mode, so:
+   - Changes to the code are immediately available
+   - The package can be imported from anywhere: `from vita49 import ...`
+   - All example scripts and tests can find the library
 
 3. **Run tests**
    ```bash

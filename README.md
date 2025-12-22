@@ -64,7 +64,18 @@ Listening for config on port 4990
 Ready to stream on port 4991
 ```
 
-### Step 3: Configure Pluto from Your PC
+### Step 3: Install Python Library (First Time Only)
+
+Install the VITA49 Python library in development mode:
+
+```bash
+# From the project root directory
+pip install -e .
+```
+
+This makes the `vita49` package available to all scripts and examples.
+
+### Step 4: Configure Pluto from Your PC
 
 **Why this is needed:** The config client tells Pluto:
 - What frequency/sample rate/gain to use
@@ -81,7 +92,7 @@ python src/vita49/config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 
 - Pluto adds your PC to subscriber list
 - Pluto starts streaming IQ data to your PC on port 4991
 
-### Step 4: Receive and Visualize Data
+### Step 5: Receive and Visualize Data
 
 ```bash
 python tests/e2e/step3_plotting_receiver.py --port 4991
@@ -138,6 +149,7 @@ Client      (FFT)      (Energy)   (Custom)
 ### Prerequisites
 
 **On your PC (for building):**
+- Python 3.7+ with pip
 - ARM cross-compiler OR Docker OR WSL
 - make
 - SSH/SCP client
@@ -145,6 +157,23 @@ Client      (FFT)      (Energy)   (Custom)
 **On Pluto (runtime):**
 - libiio (pre-installed on Pluto+ firmware)
 - Nothing else!
+
+### Python Library Setup
+
+After cloning the repository, install the VITA49 Python library:
+
+```bash
+# Install in editable/development mode
+pip install -e .
+
+# Or install with testing dependencies
+pip install -e ".[dev]"
+```
+
+This allows you to:
+- Run all example scripts and receivers
+- Import `vita49` from anywhere
+- Modify the library code without reinstalling
 
 ### Build Methods
 

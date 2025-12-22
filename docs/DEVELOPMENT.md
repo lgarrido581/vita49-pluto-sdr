@@ -4,6 +4,50 @@ This guide covers the architecture, testing, and development workflows for the V
 
 ---
 
+## Development Setup
+
+### Prerequisites
+
+- Python 3.7+
+- pip
+- Git
+- ARM cross-compiler OR Docker (for building C streamer)
+
+### Initial Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/yourusername/vita49-pluto.git
+   cd vita49-pluto
+   ```
+
+2. **Install the Python package in editable mode:**
+   ```bash
+   # Basic installation
+   pip install -e .
+
+   # Or with development dependencies (testing, etc.)
+   pip install -e ".[dev]"
+   ```
+
+   **Why editable mode (`-e`)?**
+   - Changes to source code are immediately available
+   - No need to reinstall after editing files
+   - The `vita49` package can be imported from anywhere
+   - All scripts, examples, and tests can find the library
+
+3. **Verify installation:**
+   ```bash
+   python -c "from vita49 import packets; print('✓ vita49 library installed')"
+   ```
+
+4. **Run tests:**
+   ```bash
+   pytest tests/ -v
+   ```
+
+---
+
 ## Architecture Overview
 
 ### System Components

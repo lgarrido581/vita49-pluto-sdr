@@ -2,16 +2,19 @@
 
 Complete guide for deploying and using the VITA49 streamer with ADALM-Pluto SDR.
 
-## Quick Start (3 Steps)
+## Quick Start (4 Steps)
 
 ```bash
-# 1. Build and deploy to Pluto
+# 1. Install Python library (first time only)
+pip install -e .
+
+# 2. Build and deploy to Pluto
 make deploy
 
-# 2. Configure from your PC
-python vita49_config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
+# 3. Configure from your PC
+python src/vita49/config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
 
-# 3. Receive data on your PC
+# 4. Receive data on your PC
 python examples/signal_processing_harness.py --port 4991
 ```
 
