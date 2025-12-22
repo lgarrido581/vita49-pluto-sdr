@@ -15,7 +15,7 @@ import argparse
 import sys
 
 # Import directly - no multiprocessing
-from test_e2e_step2_vita49_restreamer import VITA49Restreamer
+from tests.e2e.step2_vita49_restreamer import VITA49Restreamer
 
 
 def main():

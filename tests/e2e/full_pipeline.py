@@ -45,7 +45,7 @@ def run_vita49_restreamer(
 ):
     """Run VITA49 re-streamer in separate process"""
     try:
-        from test_e2e_step2_vita49_restreamer import VITA49Restreamer
+        from tests.e2e.step2_vita49_restreamer import VITA49Restreamer
 
         logger.info("Starting VITA49 re-streamer...")
 
@@ -86,7 +86,7 @@ def run_vita49_restreamer(
 def run_plotting_receiver(port: int, fft_size: int):
     """Run plotting receiver in separate process"""
     try:
-        from test_e2e_step3_plotting_receiver import VITA49PlottingReceiver
+        from tests.e2e.step3_plotting_receiver import VITA49PlottingReceiver
 
         logger.info("Starting plotting receiver...")
 

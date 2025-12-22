@@ -30,7 +30,7 @@ except ImportError:
     HAS_ADI = False
     print("ERROR: pyadi-iio not installed. Install with: pip install pyadi-iio")
 
-from vita49_packets import (
+from vita49.packets import (
     VRTSignalDataPacket,
     VRTContextPacket,
     VRTTimestamp,

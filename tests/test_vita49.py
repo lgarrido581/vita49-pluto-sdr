@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-from vita49_packets import (
+from vita49.packets import (
     VRTHeader,
     VRTSignalDataPacket,
     VRTContextPacket,
@@ -30,13 +30,20 @@ from vita49_packets import (
     calculate_max_samples_per_packet
 )
 
-from vita49_stream_server import (
+from vita49.stream_server import (
     VITA49StreamServer,
     VITA49StreamClient,
     SimulatedSDRInterface,
     SDRConfig,
     StreamStatistics
 )
+
+# Import from examples directory
+import sys
+from pathlib import Path
+examples_dir = Path(__file__).parent.parent / 'examples'
+if str(examples_dir) not in sys.path:
+    sys.path.insert(0, str(examples_dir))
 
 from signal_processing_harness import (
     SignalProcessingHarness,
