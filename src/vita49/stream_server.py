@@ -55,12 +55,10 @@ from enum import Enum
 from typing import Optional, List, Callable, Dict, Tuple
 import numpy as np
 
-try:
-    import adi
-    HAS_ADI = True
-except ImportError:
-    HAS_ADI = False
-    print("Warning: pyadi-iio not available. Running in simulation mode.")
+# Lazy import of adi module - only imported when PlutoSDRInterface is instantiated
+# This allows VITA49StreamClient and other pure VITA49 classes to be used
+# without requiring pyadi-iio/libiio dependencies
+HAS_ADI = None  # Will be set on first use
 
 from .packets import (
     VRTSignalDataPacket,
@@ -189,6 +187,19 @@ class PlutoSDRInterface:
 
     def connect(self) -> bool:
         """Connect to SDR and configure"""
+        global HAS_ADI
+
+        # Lazy import of adi module
+        if HAS_ADI is None:
+            try:
+                import adi
+                HAS_ADI = True
+                # Store in globals so we can use it
+                globals()['adi'] = adi
+            except ImportError:
+                HAS_ADI = False
+                logger.warning("pyadi-iio not available, using simulation mode")
+
         try:
             if not HAS_ADI:
                 logger.warning("pyadi-iio not available, using simulation mode")
@@ -404,7 +415,8 @@ class VITA49StreamServer:
         }
 
         # SDR interface
-        self.use_simulation = use_simulation or not HAS_ADI
+        # Note: HAS_ADI will be checked lazily when PlutoSDRInterface.connect() is called
+        self.use_simulation = use_simulation or (HAS_ADI == False)
         if self.use_simulation:
             self.sdr = SimulatedSDRInterface(self.sdr_config)
         else:
