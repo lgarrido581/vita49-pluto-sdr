@@ -15,15 +15,33 @@ Stream IQ samples from Pluto to your PC over Ethernet/WiFi using the VITA49 stan
 
 ## Quick Start
 
-```bash
-# 1. Build and deploy to Pluto
-make deploy
+### Build with Docker (Recommended - Works on All Platforms)
 
+```bash
+# Windows
+.\scripts\build-with-docker.bat
+
+# Linux/macOS
+./scripts/build-with-docker.sh
+
+# Then deploy to Pluto
+scp vita49_streamer root@pluto.local:/root/
+```
+
+### Or Build Natively (Linux Only)
+
+```bash
+make deploy
+```
+
+### Configure and Receive
+
+```bash
 # 2. Configure from your PC
-python vita49_config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
+python src/vita49/config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
 
 # 3. Receive and visualize data
-python tests/e2e/test_plotting_receiver.py --port 4991
+python tests/e2e/step3_plotting_receiver.py --port 4991
 ```
 
 Done! Your Pluto is streaming VITA49 IQ data over the network.
@@ -81,28 +99,30 @@ Client      (FFT)      (Energy)   (Custom)
 
 ### Build Methods
 
-Choose what works for your platform:
+**Method 1: Docker (Recommended - All Platforms)**
 
-**Linux:**
+Works on Windows, macOS, and Linux without installing toolchains:
+
+```bash
+# Windows
+.\scripts\build-with-docker.bat
+
+# Linux/macOS/WSL
+./scripts/build-with-docker.sh
+```
+
+**Method 2: Native Toolchain (Linux)**
+
 ```bash
 sudo apt-get install gcc-arm-linux-gnueabihf libiio-dev make
 make deploy
 ```
 
-**macOS:**
-```bash
-# Use Docker (recommended)
-./scripts/build-with-docker.sh
-```
+**Method 3: WSL (Windows Alternative)**
 
-**Windows:**
 ```powershell
-# Use WSL (recommended)
 wsl --install
 # Then follow Linux instructions in WSL
-
-# Or use Docker
-.\scripts\build-with-docker.bat
 ```
 
 See **[docs/BUILD.md](docs/BUILD.md)** for detailed instructions.

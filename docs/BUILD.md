@@ -4,26 +4,24 @@ This guide covers building the VITA49 streamer for deployment to ADALM-Pluto SDR
 
 ## Quick Start
 
-### Using Pre-Built Binary (Easiest)
+### Using Docker (Recommended - All Platforms)
 
-If you have a pre-built ARM binary:
+**No toolchain installation required!** Works on Windows, macOS, and Linux:
 
+**Windows:**
+```powershell
+.\scripts\build-with-docker.bat
+```
+
+**Linux/macOS:**
+```bash
+./scripts/build-with-docker.sh
+```
+
+Then deploy:
 ```bash
 scp vita49_streamer root@pluto.local:/root/
-ssh root@pluto.local
-chmod +x vita49_streamer
-./vita49_streamer
 ```
-
-Done!
-
-### Build and Deploy in One Command
-
-```bash
-make deploy
-```
-
-This cross-compiles the C streamer for ARM and deploys it to your Pluto.
 
 ---
 
@@ -33,14 +31,103 @@ Choose the method that best fits your environment:
 
 | Method | Best For | Setup Time | Platforms |
 |--------|----------|------------|-----------|
-| **Native Toolchain** | Linux developers | 5 min | Linux, macOS |
+| **Docker** | All users, no install | 2 min | Windows, macOS, Linux |
+| **Native Toolchain** | Linux developers | 5 min | Linux |
 | **WSL** | Windows developers | 5 min | Windows |
-| **Docker** | Any platform, no install | 10 min | All |
 | **GitHub Actions** | CI/CD, automatic builds | 15 min | All |
 
 ---
 
-## Method 1: Native ARM Cross-Compiler
+## Method 1: Docker (Recommended - No Toolchain Installation)
+
+Use Docker to build without installing the ARM toolchain on your system. **This is the easiest method for Windows and macOS users.**
+
+### Prerequisites
+
+- **Docker Desktop** (Windows/macOS): https://www.docker.com/products/docker-desktop
+- **Docker Engine** (Linux): Included in most distributions
+
+### Using Automated Scripts (Recommended)
+
+The scripts automatically handle paths and Docker configuration:
+
+**Windows:**
+```powershell
+# From any directory
+.\scripts\build-with-docker.bat
+
+# The script will:
+# - Change to project root
+# - Build Docker image
+# - Compile ARM binary
+# - Show success message
+```
+
+**Linux/macOS:**
+```bash
+# Make executable (first time only)
+chmod +x scripts/build-with-docker.sh
+
+# Build
+./scripts/build-with-docker.sh
+```
+
+**What the scripts do:**
+1. Navigate to project root automatically
+2. Build Docker image from `docker/Dockerfile`
+3. Compile `src/pluto_vita49_streamer.c` for ARM
+4. Create `vita49_streamer` binary in project root
+5. Verify the binary
+
+### Deploy to Pluto
+
+After building, deploy the binary:
+
+```bash
+# Copy to Pluto
+scp vita49_streamer root@pluto.local:/root/
+
+# SSH and run
+ssh root@pluto.local
+chmod +x vita49_streamer
+./vita49_streamer
+```
+
+### Manual Docker Build (Advanced)
+
+If you prefer manual control:
+
+```bash
+# From project root
+docker build -t pluto-builder -f docker/Dockerfile .
+docker run --rm -v "$(pwd)":/build pluto-builder
+
+# Windows PowerShell:
+docker build -t pluto-builder -f docker/Dockerfile .
+docker run --rm -v ${PWD}:/build pluto-builder
+```
+
+### Docker Configuration
+
+The Dockerfile is located at `docker/Dockerfile` and contains:
+```dockerfile
+FROM debian:bullseye
+
+RUN apt-get update && apt-get install -y \
+    gcc-arm-linux-gnueabihf \
+    libiio-dev \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+CMD ["make", "cross"]
+```
+
+---
+
+## Method 2: Native ARM Cross-Compiler (Linux)
+
+For Linux users who prefer native toolchains.
 
 ### Install Prerequisites
 
@@ -55,34 +142,22 @@ sudo apt-get install gcc-arm-linux-gnueabihf libiio-dev make
 sudo dnf install gcc-arm-linux-gnu libiio-devel make
 ```
 
-**macOS:**
-```bash
-brew install arm-linux-gnueabihf-binutils
-# Note: macOS support is limited, Docker recommended
-```
-
-### Build Commands
+### Build and Deploy
 
 ```bash
 # Cross-compile for ARM
 make cross
-
-# Or simply (cross is default)
-make
 
 # Deploy to Pluto
 make deploy
 
 # Custom Pluto IP
 make deploy PLUTO_IP=192.168.2.1
-
-# Clean build artifacts
-make clean
 ```
 
 ---
 
-## Method 2: Windows with WSL (Recommended for Windows)
+## Method 3: Windows with WSL
 
 Windows Subsystem for Linux provides a complete Linux environment on Windows.
 
@@ -112,60 +187,6 @@ make deploy
 - Seamless access to Windows files
 - Best long-term solution for Windows development
 - Works with all Linux-based tools and scripts
-
----
-
-## Method 3: Docker (No Toolchain Installation)
-
-Use Docker to build without installing the ARM toolchain on your system.
-
-### Prerequisites
-
-- Docker Desktop (Windows/macOS) or Docker Engine (Linux)
-- Download from: https://www.docker.com/products/docker-desktop
-
-### Using Provided Scripts
-
-**Linux/macOS:**
-```bash
-chmod +x scripts/build-with-docker.sh
-./scripts/build-with-docker.sh
-```
-
-**Windows (PowerShell):**
-```powershell
-.\scripts\build-with-docker.bat
-```
-
-### Manual Docker Build
-
-```bash
-# Build the Docker image
-docker build -t pluto-builder -f docker/Dockerfile .
-
-# Compile the binary
-docker run --rm -v $(pwd):/build pluto-builder
-
-# On Windows PowerShell:
-docker run --rm -v ${PWD}:/build pluto-builder
-
-# Deploy to Pluto
-scp vita49_streamer root@pluto.local:/root/
-```
-
-The Dockerfile is located at `docker/Dockerfile` and contains:
-```dockerfile
-FROM debian:bullseye
-
-RUN apt-get update && apt-get install -y \
-    gcc-arm-linux-gnueabihf \
-    libiio-dev \
-    make \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-CMD ["make", "cross"]
-```
 
 ---
 

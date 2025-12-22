@@ -20,8 +20,11 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM Change to project root directory
+cd /d "%~dp0\.."
+
 echo [1/3] Building Docker image...
-docker build -t pluto-builder . || (
+docker build -t pluto-builder -f docker/Dockerfile . || (
     echo ERROR: Failed to build Docker image
     pause
     exit /b 1
@@ -29,7 +32,7 @@ docker build -t pluto-builder . || (
 
 echo.
 echo [2/3] Compiling ARM binary...
-docker run --rm -v %cd%:/build pluto-builder || (
+docker run --rm -v "%cd%":/build pluto-builder || (
     echo ERROR: Compilation failed
     pause
     exit /b 1

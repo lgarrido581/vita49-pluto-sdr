@@ -18,8 +18,12 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
+# Change to project root directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
 echo "[1/3] Building Docker image..."
-docker build -t pluto-builder .
+docker build -t pluto-builder -f docker/Dockerfile .
 
 echo ""
 echo "[2/3] Compiling ARM binary..."
