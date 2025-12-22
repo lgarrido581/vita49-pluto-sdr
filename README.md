@@ -15,7 +15,9 @@ Stream IQ samples from Pluto to your PC over Ethernet/WiFi using the VITA49 stan
 
 ## Quick Start
 
-### Build with Docker (Recommended - Works on All Platforms)
+### Step 1: Build the Streamer
+
+**Using Docker (Recommended - Works on All Platforms):**
 
 ```bash
 # Windows
@@ -23,26 +25,73 @@ Stream IQ samples from Pluto to your PC over Ethernet/WiFi using the VITA49 stan
 
 # Linux/macOS
 ./scripts/build-with-docker.sh
+```
 
-# Then deploy to Pluto
+**Or Build Natively (Linux Only):**
+```bash
+make cross
+```
+
+### Step 2: Deploy to Pluto
+
+**Copy the binary to Pluto:**
+```bash
+# Using SCP (if available)
 scp vita49_streamer root@pluto.local:/root/
+
+# Or use WinSCP/MobaXterm for GUI file transfer
+# Connect to pluto.local, user: root, password: analog
 ```
 
-### Or Build Natively (Linux Only)
-
+**Start the streamer on Pluto:**
 ```bash
-make deploy
+# SSH to Pluto
+ssh root@pluto.local
+# Password: analog
+
+# Make executable and run in background
+chmod +x vita49_streamer
+./vita49_streamer &
+
+# Verify it's running
+ps | grep vita49
 ```
 
-### Configure and Receive
+**Output when streamer starts:**
+```
+VITA49 Streamer Started
+Listening for config on port 4990
+Ready to stream on port 4991
+```
+
+### Step 3: Configure Pluto from Your PC
+
+**Why this is needed:** The config client tells Pluto:
+- What frequency/sample rate/gain to use
+- **Your PC's IP address** (so Pluto knows where to send data)
+- Registers you as a subscriber to receive the stream
 
 ```bash
-# 2. Configure from your PC
 python src/vita49/config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
+```
 
-# 3. Receive and visualize data
+**What happens:**
+- Sends VITA49 Context packet to Pluto's port 4990
+- Pluto reconfigures the AD9361 SDR
+- Pluto adds your PC to subscriber list
+- Pluto starts streaming IQ data to your PC on port 4991
+
+### Step 4: Receive and Visualize Data
+
+```bash
 python tests/e2e/step3_plotting_receiver.py --port 4991
 ```
+
+**Now you'll see:**
+- Real-time FFT spectrum
+- Time domain I/Q waveforms
+- Waterfall spectrogram
+- Stream statistics
 
 Done! Your Pluto is streaming VITA49 IQ data over the network.
 

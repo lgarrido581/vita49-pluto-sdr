@@ -284,6 +284,45 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
     *packet_count = (*packet_count + 1) & 0xF;
 }
 
+/* Parse VITA49 Context packet and extract configuration */
+static int parse_context_packet(const uint8_t *buf, size_t len,
+                                uint64_t *freq_hz, uint32_t *rate_hz, double *gain_db) {
+    if (len < 28) return -1;  /* Minimum context packet size */
+
+    /* Skip VRT header (4 bytes) and stream ID (4 bytes) */
+    const uint8_t *p = buf + 8;
+
+    /* Skip timestamps (12 bytes) */
+    p += 12;
+
+    /* Read Context Indicator Field (CIF) */
+    uint32_t cif = ntohl(*(uint32_t *)p);
+    p += 4;
+
+    /* Check and parse fields based on CIF bits */
+    if (cif & (1 << 27)) {  /* RF Reference Frequency present */
+        uint64_t freq = ((uint64_t)ntohl(*(uint32_t *)p) << 32) |
+                        ntohl(*(uint32_t *)(p + 4));
+        *freq_hz = freq;
+        p += 8;
+    }
+
+    if (cif & (1 << 21)) {  /* Sample Rate present */
+        uint64_t rate = ((uint64_t)ntohl(*(uint32_t *)p) << 32) |
+                        ntohl(*(uint32_t *)(p + 4));
+        *rate_hz = (uint32_t)rate;
+        p += 8;
+    }
+
+    if (cif & (1 << 23)) {  /* Gain present */
+        int16_t gain_fixed = ntohs(*(int16_t *)p);
+        *gain_db = gain_fixed / 128.0;
+        p += 2;
+    }
+
+    return 0;
+}
+
 /* Control thread - receives configuration */
 static void *control_thread(void *arg) {
     int *sock_fd = (int *)arg;
@@ -292,6 +331,10 @@ static void *control_thread(void *arg) {
     socklen_t client_len = sizeof(client_addr);
 
     printf("[Control] Listening on port %d\n", CONTROL_PORT);
+    printf("[Control] Default config: %.3f MHz, %.1f MSPS, %.1f dB\n",
+           g_sdr_config.center_freq_hz / 1e6,
+           g_sdr_config.sample_rate_hz / 1e6,
+           g_sdr_config.gain_db);
 
     while (g_running) {
         ssize_t recv_len = recvfrom(*sock_fd, buf, sizeof(buf), 0,
@@ -301,12 +344,59 @@ static void *control_thread(void *arg) {
 
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
-        printf("[Control] Received %zd bytes from %s\n", recv_len, ip_str);
+        printf("\n[Control] ========================================\n");
+        printf("[Control] Received config from %s (%zd bytes)\n", ip_str, recv_len);
 
-        /* TODO: Parse context packet and update configuration */
-        /* For now, just add as subscriber */
+        /* Parse context packet */
+        uint64_t new_freq = g_sdr_config.center_freq_hz;
+        uint32_t new_rate = g_sdr_config.sample_rate_hz;
+        double new_gain = g_sdr_config.gain_db;
+
+        if (parse_context_packet(buf, recv_len, &new_freq, &new_rate, &new_gain) == 0) {
+            bool changed = false;
+
+            /* Check what changed and update */
+            pthread_mutex_lock(&g_sdr_config.mutex);
+
+            if (new_freq != g_sdr_config.center_freq_hz) {
+                printf("[Control] Frequency: %.3f MHz -> %.3f MHz\n",
+                       g_sdr_config.center_freq_hz / 1e6, new_freq / 1e6);
+                g_sdr_config.center_freq_hz = new_freq;
+                changed = true;
+            }
+
+            if (new_rate != g_sdr_config.sample_rate_hz) {
+                printf("[Control] Sample Rate: %.1f MSPS -> %.1f MSPS\n",
+                       g_sdr_config.sample_rate_hz / 1e6, new_rate / 1e6);
+                g_sdr_config.sample_rate_hz = new_rate;
+                g_sdr_config.bandwidth_hz = new_rate * 0.8;
+                changed = true;
+            }
+
+            if (new_gain != g_sdr_config.gain_db) {
+                printf("[Control] Gain: %.1f dB -> %.1f dB\n",
+                       g_sdr_config.gain_db, new_gain);
+                g_sdr_config.gain_db = new_gain;
+                changed = true;
+            }
+
+            pthread_mutex_unlock(&g_sdr_config.mutex);
+
+            if (!changed) {
+                printf("[Control] No changes (same as current config)\n");
+            } else {
+                printf("[Control] Configuration updated successfully\n");
+                /* Note: Actual SDR reconfiguration happens in streaming thread */
+            }
+        } else {
+            printf("[Control] Warning: Failed to parse context packet\n");
+        }
+
+        /* Add as subscriber */
         client_addr.sin_port = htons(DATA_PORT);
         add_subscriber(&client_addr);
+        printf("[Control] Added %s as subscriber (total: %d)\n", ip_str, g_subscriber_count);
+        printf("[Control] ========================================\n\n");
 
         g_stats.reconfigs++;
     }
