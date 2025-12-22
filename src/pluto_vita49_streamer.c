@@ -299,25 +299,39 @@ static int parse_context_packet(const uint8_t *buf, size_t len,
     uint32_t cif = ntohl(*(uint32_t *)p);
     p += 4;
 
-    /* Check and parse fields based on CIF bits */
-    if (cif & (1 << 27)) {  /* RF Reference Frequency present */
-        uint64_t freq = ((uint64_t)ntohl(*(uint32_t *)p) << 32) |
-                        ntohl(*(uint32_t *)(p + 4));
-        *freq_hz = freq;
+    /* Parse context fields in descending CIF bit order (VITA49 spec) */
+
+    /* Bit 29: Bandwidth (not currently used, but must skip if present) */
+    if (cif & (1 << 29)) {
+        p += 8;  /* Skip 64-bit bandwidth field */
+    }
+
+    /* Bit 27: RF Reference Frequency */
+    if (cif & (1 << 27)) {
+        /* Read 64-bit signed fixed-point value (20-bit radix) */
+        uint32_t high = ntohl(*(uint32_t *)p);
+        uint32_t low = ntohl(*(uint32_t *)(p + 4));
+        int64_t freq_fixed = ((int64_t)high << 32) | (int64_t)low;
+        *freq_hz = (uint64_t)(freq_fixed / (1 << 20));  /* Divide by 2^20 */
         p += 8;
     }
 
-    if (cif & (1 << 21)) {  /* Sample Rate present */
-        uint64_t rate = ((uint64_t)ntohl(*(uint32_t *)p) << 32) |
-                        ntohl(*(uint32_t *)(p + 4));
-        *rate_hz = (uint32_t)rate;
-        p += 8;
+    /* Bit 23: Gain (comes before bit 21!) */
+    if (cif & (1 << 23)) {
+        /* Read 16-bit signed fixed-point value (7-bit radix) */
+        int16_t gain_fixed = (int16_t)ntohs(*(uint16_t *)p);
+        *gain_db = gain_fixed / 128.0;  /* Divide by 2^7 */
+        p += 4;  /* Skip both stage1 and stage2 (4 bytes total) */
     }
 
-    if (cif & (1 << 23)) {  /* Gain present */
-        int16_t gain_fixed = ntohs(*(int16_t *)p);
-        *gain_db = gain_fixed / 128.0;
-        p += 2;
+    /* Bit 21: Sample Rate */
+    if (cif & (1 << 21)) {
+        /* Read 64-bit signed fixed-point value (20-bit radix) */
+        uint32_t high = ntohl(*(uint32_t *)p);
+        uint32_t low = ntohl(*(uint32_t *)(p + 4));
+        int64_t rate_fixed = ((int64_t)high << 32) | (int64_t)low;
+        *rate_hz = (uint32_t)(rate_fixed / (1 << 20));  /* Divide by 2^20 */
+        p += 8;
     }
 
     return 0;
@@ -330,6 +344,12 @@ static void *control_thread(void *arg) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
+    /* Set socket timeout so we can check g_running periodically */
+    struct timeval timeout;
+    timeout.tv_sec = 1;  /* 1 second timeout */
+    timeout.tv_usec = 0;
+    setsockopt(*sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
     printf("[Control] Listening on port %d\n", CONTROL_PORT);
     printf("[Control] Default config: %.3f MHz, %.1f MSPS, %.1f dB\n",
            g_sdr_config.center_freq_hz / 1e6,
@@ -340,7 +360,7 @@ static void *control_thread(void *arg) {
         ssize_t recv_len = recvfrom(*sock_fd, buf, sizeof(buf), 0,
                                    (struct sockaddr *)&client_addr, &client_len);
 
-        if (recv_len < 0) continue;
+        if (recv_len < 0) continue;  /* Timeout or error, check g_running */
 
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
@@ -401,6 +421,7 @@ static void *control_thread(void *arg) {
         g_stats.reconfigs++;
     }
 
+    printf("[Control] Thread stopped\n");
     return NULL;
 }
 

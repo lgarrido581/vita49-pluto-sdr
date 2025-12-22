@@ -57,22 +57,23 @@ class VITA49ConfigClient:
         def encode_hz(val):
             return struct.pack('>q', int(val * (1 << 20)))
 
+        # Fields must be added in descending CIF bit order (VITA49 spec)
         if bandwidth_hz is not None:
             cif |= (1 << 29)
             context_fields.append(encode_hz(bandwidth_hz))
 
         if center_freq_hz is not None:
-            cif |= (1 << 27)
+            cif |= (1 << 27)  # RF Reference Frequency
             context_fields.append(encode_hz(center_freq_hz))
 
-        if sample_rate_hz is not None:
-            cif |= (1 << 21)
-            context_fields.append(encode_hz(sample_rate_hz))
-
         if gain_db is not None:
-            cif |= (1 << 23)
+            cif |= (1 << 23)  # Gain (bit 23 comes before bit 21!)
             gain_fixed = int(gain_db * 128)
             context_fields.append(struct.pack('>hh', gain_fixed, 0))
+
+        if sample_rate_hz is not None:
+            cif |= (1 << 21)  # Sample Rate
+            context_fields.append(encode_hz(sample_rate_hz))
 
         # Calculate packet size
         field_bytes = b''.join(context_fields)
