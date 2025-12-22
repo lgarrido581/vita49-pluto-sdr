@@ -33,6 +33,10 @@ endif
 CFLAGS = -Wall -Wextra -O2 -std=gnu99
 LDFLAGS = -liio -lpthread
 
+# Source files
+SRC_DIR = src
+C_SOURCE = $(SRC_DIR)/pluto_vita49_streamer.c
+
 # Target binary
 TARGET_BIN = vita49_streamer
 
@@ -51,7 +55,7 @@ cross:
 	@echo "=========================================="
 	@echo "Cross-compiling for ARM (Pluto)"
 	@echo "=========================================="
-	$(CC_CROSS) $(CFLAGS) -o $(TARGET_BIN) pluto_vita49_streamer.c $(LDFLAGS)
+	$(CC_CROSS) $(CFLAGS) -o $(TARGET_BIN) $(C_SOURCE) $(LDFLAGS)
 	$(STRIP_CROSS) $(TARGET_BIN)
 	@echo ""
 	@echo "✓ Build complete: $(TARGET_BIN)"
@@ -63,7 +67,7 @@ native:
 	@echo "=========================================="
 	@echo "Native compilation (on Pluto)"
 	@echo "=========================================="
-	$(CC_NATIVE) $(CFLAGS) -o $(TARGET_BIN) pluto_vita49_streamer.c $(LDFLAGS)
+	$(CC_NATIVE) $(CFLAGS) -o $(TARGET_BIN) $(C_SOURCE) $(LDFLAGS)
 	$(STRIP_NATIVE) $(TARGET_BIN)
 	@echo ""
 	@echo "✓ Build complete: $(TARGET_BIN)"
