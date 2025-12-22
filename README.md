@@ -1,264 +1,289 @@
-# VITA 49 Embedded Streamer for Pluto+ ARM
+# VITA49 Pluto Streamer
 
-Minimal-footprint VITA 49 IQ streaming implementation designed to run 
-directly on the ADALM-Pluto+ Zynq ARM Cortex-A9 processor.
+**Turn your ADALM-Pluto SDR into a networked VITA49 streaming server**
+
+Stream IQ samples from Pluto to your PC over Ethernet/WiFi using the VITA49 standard protocol. The streamer runs directly on Pluto's ARM processor with minimal footprint, while your applications run on a host PC.
 
 ## Features
 
-- **Minimal Dependencies**: Only requires numpy (no scipy, no asyncio)
-- **Low Memory**: ~15 MB total footprint
-- **Low CPU**: 20-30% at 30 MSPS single channel
-- **Direct IIO**: Uses local IIO when running on-device
-- **Standards Compliant**: VITA 49.0 Signal Data + Context packets
+- **Minimal Footprint**: 50 KB binary, 2 MB RAM, 20-30% CPU on Pluto ARM
+- **No Dependencies**: Only requires libiio (already on Pluto firmware)
+- **Network Control**: Configure Pluto remotely via VITA49 packets - no SSH needed
+- **Multiple Receivers**: Unlimited simultaneous receivers on the same stream
+- **Standards Compliant**: Full VITA 49.0 implementation (Signal Data + Context packets)
+- **Cross-Platform**: Build on Linux, macOS, Windows (via WSL/Docker)
 
 ## Quick Start
 
-### 1. Deploy to Pluto+
-
 ```bash
-# Make deployment script executable
-chmod +x deploy_to_pluto.sh
+# 1. Build and deploy to Pluto
+make deploy
 
-# Deploy (uses defaults: Pluto at 192.168.2.1, stream to 192.168.2.100)
-./deploy_to_pluto.sh
+# 2. Configure from your PC
+python vita49_config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
 
-# Or specify IPs
-./deploy_to_pluto.sh 192.168.2.1 10.0.0.50
+# 3. Receive and visualize data
+python tests/e2e/test_plotting_receiver.py --port 4991
 ```
 
-### 2. Manual Deployment
-
-```bash
-# Copy the embedded streamer
-scp vita49_embedded.py root@192.168.2.1:/root/
-
-# SSH to Pluto+
-ssh root@192.168.2.1
-
-# Run
-cd /root
-python3 vita49_embedded.py --uri local --dest 192.168.2.100
-```
-
-### 3. Receive on Host
-
-```bash
-# Using the signal processing harness from the main library
-python3 signal_processing_harness.py --port 4991
-
-# Or use a simple UDP receiver
-python3 -c "
-import socket
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(('0.0.0.0', 4991))
-while True:
-    data, addr = sock.recvfrom(65536)
-    print(f'Received {len(data)} bytes from {addr}')
-"
-```
-
-## Command Line Options
-
-```
-usage: vita49_embedded.py [-h] [--uri URI] --dest DEST [--port PORT]
-                          [--freq FREQ] [--rate RATE] [--gain GAIN]
-                          [--channels CHANNELS [CHANNELS ...]]
-                          [--buffer BUFFER] [--pkt-size PKT_SIZE]
-
-Options:
-  --uri, -u       SDR URI (default: ip:192.168.2.1, use 'local' on-device)
-  --dest, -d      Destination IP for UDP stream (required)
-  --port, -p      Base UDP port (default: 4991)
-  --freq, -f      Center frequency in Hz (default: 2.4e9)
-  --rate, -r      Sample rate in Hz (default: 30e6)
-  --gain, -g      RX gain in dB (default: 20)
-  --channels, -c  RX channels: 0, 1, or "0 1" for both (default: 0)
-  --buffer        IIO buffer size in samples (default: 16384)
-  --pkt-size      Samples per VRT packet (default: 360)
-```
-
-## Examples
-
-```bash
-# Basic streaming (on Pluto+)
-python3 vita49_embedded.py --uri local --dest 192.168.2.100
-
-# Dual channel at 5.8 GHz
-python3 vita49_embedded.py --uri local --dest 192.168.2.100 \
-    --freq 5.8e9 --channels 0 1
-
-# Lower CPU usage (reduce sample rate)
-python3 vita49_embedded.py --uri local --dest 192.168.2.100 \
-    --rate 10e6
-
-# Higher SNR (increase gain)
-python3 vita49_embedded.py --uri local --dest 192.168.2.100 \
-    --gain 40
-```
-
-## Auto-Start on Boot
-
-To automatically start streaming when the Pluto+ powers on:
-
-```bash
-# Copy service file
-scp vita49.service root@pluto.local:/etc/systemd/system/
-
-# On Pluto+:
-ssh root@pluto.local
-systemctl daemon-reload
-systemctl enable vita49
-systemctl start vita49
-
-# Check status
-systemctl status vita49
-journalctl -u vita49 -f
-```
-
-## Performance Tuning
-
-### Reduce CPU Usage
-
-```bash
-# Lower sample rate
---rate 10e6    # 10 MSPS instead of 30 MSPS
-
-# Larger packets (fewer packets/sec)
---pkt-size 720
-
-# Larger buffer (less frequent DMA)
---buffer 32768
-```
-
-### Reduce Latency
-
-```bash
-# Smaller buffer
---buffer 8192
-
-# Smaller packets
---pkt-size 180
-```
-
-### Network Optimization
-
-On the receiving host, increase UDP buffer:
-```bash
-sudo sysctl -w net.core.rmem_max=26214400
-sudo sysctl -w net.core.rmem_default=26214400
-```
-
-## Packet Format
-
-Each UDP packet contains a VITA 49.0 Signal Data Packet:
-
-```
-Offset  Size    Field
-------  ----    -----
-0       4       Header (packet type, flags, size)
-4       4       Stream ID
-8       4       Integer Timestamp (UTC seconds)
-12      8       Fractional Timestamp (picoseconds)
-20      N*4     Payload (int16 I/Q pairs, big-endian)
-20+N*4  4       Trailer (valid data indicator)
-```
-
-Context packets (sent every 100 data packets) contain:
-- Sample rate
-- Center frequency
-- Bandwidth
-- Gain
-
-## Troubleshooting
-
-### "pyadi-iio not found"
-
-```bash
-# On Pluto+:
-pip3 install pyadi-iio --break-system-packages
-# or
-opkg update && opkg install python3-pyadi-iio
-```
-
-### "numpy not found"
-
-```bash
-# On Pluto+:
-opkg update && opkg install python3-numpy
-```
-
-### No packets received on host
-
-1. Check firewall allows UDP port 4991
-2. Verify correct destination IP
-3. Check Pluto+ network connectivity: `ping 192.168.2.100`
-4. Verify streaming is running: check output on Pluto+
-
-### High packet loss
-
-1. Increase receive buffer on host (see Network Optimization)
-2. Reduce sample rate
-3. Use wired Ethernet instead of WiFi
-4. Check CPU usage on Pluto+ isn't at 100%
-
-## Integration with Main Library
-
-The embedded streamer generates packets compatible with the full 
-`vita49_pluto` library. You can:
-
-1. Receive on host using `VITA49StreamClient`
-2. Process with `SignalProcessingHarness`
-3. Record and analyze with the detection algorithms
-
-```python
-from vita49_stream_server import VITA49StreamClient
-from signal_processing_harness import SignalProcessingHarness, EnergyDetector
-
-# Simple receiver
-client = VITA49StreamClient(port=4991)
-client.start()
-
-# Or full processing
-harness = SignalProcessingHarness(port=4991)
-harness.add_detector(EnergyDetector(threshold_db=-20))
-harness.start()
-```
+Done! Your Pluto is streaming VITA49 IQ data over the network.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│              Pluto+ ARM Processor               │
-│                                                 │
-│   ┌─────────────┐                               │
-│   │   AD9361    │  RF Frontend                  │
-│   └──────┬──────┘                               │
-│          │ IIO DMA                              │
-│   ┌──────▼──────┐                               │
-│   │   libiio    │  Kernel Driver                │
-│   └──────┬──────┘                               │
-│          │                                      │
-│   ┌──────▼──────┐                               │
-│   │ pyadi-iio   │  Python Bindings              │
-│   └──────┬──────┘                               │
-│          │                                      │
-│   ┌──────▼──────────────────────────────────┐   │
-│   │       vita49_embedded.py                │   │
-│   │  ┌────────────┐  ┌──────────────────┐   │   │
-│   │  │ VRT Packet │  │ UDP Streamer     │   │   │
-│   │  │ Encoder    │  │ (socket.sendto)  │   │   │
-│   │  └────────────┘  └──────────────────┘   │   │
-│   └─────────────────────────┬───────────────┘   │
-│                             │                   │
-└─────────────────────────────│───────────────────┘
-                              │ UDP/Ethernet
-                              ▼
-                    ┌─────────────────┐
-                    │   Host System   │
-                    │ (Processing)    │
-                    └─────────────────┘
+┌──────────────────────────────────────┐
+│   Pluto+ SDR (ARM Processor)         │
+│   Running: vita49_streamer (50 KB)   │
+│   • Port 4990: Config packets        │
+│   • Port 4991: IQ data stream        │
+└──────────────────────────────────────┘
+         │              │
+   Config │              │ IQ Stream
+         ▼              ▼
+┌─────────────────────────────────────────┐
+│        Your PC / Network                │
+└─────────────────────────────────────────┘
+   │           │           │           │
+   ▼           ▼           ▼           ▼
+Config      Plotter    Detector   Your App
+Client      (FFT)      (Energy)   (Custom)
 ```
+
+## What's Included
+
+| Component | Description |
+|-----------|-------------|
+| **C Streamer** | Minimal streamer for Pluto ARM (recommended) |
+| **Python Library** | VITA49 packet encoder/decoder for PC |
+| **Config Client** | Remote configuration tool |
+| **Test Suite** | End-to-end tests and examples |
+| **Examples** | Plotting receiver, signal processing harness |
+| **Build Scripts** | Cross-platform build and deployment |
+
+## Documentation
+
+- **[Quick Start Guide](docs/USAGE.md)** - Deploy and use the streamer
+- **[Build Guide](docs/BUILD.md)** - Build for all platforms (Linux/macOS/Windows)
+- **[Development Guide](docs/DEVELOPMENT.md)** - Architecture, testing, contributing
+
+## Installation
+
+### Prerequisites
+
+**On your PC (for building):**
+- ARM cross-compiler OR Docker OR WSL
+- make
+- SSH/SCP client
+
+**On Pluto (runtime):**
+- libiio (pre-installed on Pluto+ firmware)
+- Nothing else!
+
+### Build Methods
+
+Choose what works for your platform:
+
+**Linux:**
+```bash
+sudo apt-get install gcc-arm-linux-gnueabihf libiio-dev make
+make deploy
+```
+
+**macOS:**
+```bash
+# Use Docker (recommended)
+./scripts/build-with-docker.sh
+```
+
+**Windows:**
+```powershell
+# Use WSL (recommended)
+wsl --install
+# Then follow Linux instructions in WSL
+
+# Or use Docker
+.\scripts\build-with-docker.bat
+```
+
+See **[docs/BUILD.md](docs/BUILD.md)** for detailed instructions.
+
+## Usage Examples
+
+### WiFi Signal Analysis (2.4 GHz)
+
+```bash
+python vita49_config_client.py --pluto pluto.local --freq 2.437e9 --rate 20e6 --gain 30
+python tests/e2e/test_plotting_receiver.py --port 4991
+```
+
+### FM Radio Reception (103.7 MHz)
+
+```bash
+python vita49_config_client.py --pluto pluto.local --freq 103.7e6 --rate 2e6 --gain 40
+python tests/e2e/test_plotting_receiver.py --port 4991
+```
+
+### Multiple Receivers in Parallel
+
+```bash
+# Terminal 1: Spectrum plot
+python tests/e2e/test_plotting_receiver.py --port 4991
+
+# Terminal 2: Energy detector
+python examples/signal_processing_harness.py --port 4991
+
+# Terminal 3: Your custom app
+python your_app.py --port 4991
+```
+
+All receive the **same** stream simultaneously!
+
+## Custom Receiver Example
+
+```python
+from vita49.stream_server import VITA49StreamClient
+import numpy as np
+
+class MyReceiver:
+    def __init__(self):
+        self.client = VITA49StreamClient(port=4991)
+        self.client.on_samples(self.process_samples)
+
+    def process_samples(self, packet, samples):
+        # Your DSP here!
+        power_dbfs = 10 * np.log10(np.mean(np.abs(samples)**2))
+        print(f"Power: {power_dbfs:.1f} dBFS")
+
+    def start(self):
+        self.client.start()
+
+# Run it
+receiver = MyReceiver()
+receiver.start()
+```
+
+## Performance
+
+Tested on ADALM-Pluto:
+
+| Metric | Value |
+|--------|-------|
+| **Binary Size** | 50 KB (300x smaller than Python) |
+| **RAM Usage** | 2 MB (vs 15 MB for Python) |
+| **CPU Usage** | 20-30% at 30 MSPS |
+| **Latency** | 1-2 ms (UDP + buffering) |
+| **Sample Rate** | 2-61 MSPS (AD9361 range) |
+| **Network Bandwidth** | ~240 Mbps @ 30 MSPS |
+
+## Repository Structure
+
+```
+vita49-pluto/
+├── src/
+│   ├── pluto_vita49_streamer.c    # C streamer (for Pluto)
+│   ├── vita49/                     # Python VITA49 library
+│   └── streamers/                  # Alternative Python streamers
+├── examples/                       # Example receivers
+├── tests/                          # Test suite
+├── scripts/                        # Build and deployment scripts
+├── docs/                           # Documentation
+│   ├── BUILD.md
+│   ├── USAGE.md
+│   └── DEVELOPMENT.md
+├── Makefile                        # Build system
+└── README.md                       # This file
+```
+
+## Auto-Start on Boot
+
+Make Pluto start streaming automatically:
+
+```bash
+ssh root@pluto.local
+cat >> /etc/rc.local << 'EOF'
+/root/vita49_streamer &
+EOF
+chmod +x /etc/rc.local
+```
+
+Now Pluto streams on boot!
+
+## Troubleshooting
+
+### Can't connect to Pluto
+
+```bash
+ping pluto.local
+ping 192.168.2.1
+ssh root@pluto.local  # Password: analog
+```
+
+### No data received on PC
+
+```bash
+# Check streamer is running
+ssh root@pluto.local 'ps | grep vita49'
+
+# Send config to register as subscriber
+python vita49_config_client.py --pluto pluto.local --freq 2.4e9
+
+# Check firewall
+sudo ufw allow 4991/udp  # Linux
+```
+
+See **[docs/USAGE.md](docs/USAGE.md#troubleshooting)** for more help.
+
+## Development
+
+### Running Tests
+
+```bash
+# Unit tests
+pytest tests/ -v
+
+# End-to-end test (requires Pluto hardware)
+python tests/e2e/test_full_pipeline.py --pluto-uri ip:192.168.2.1
+```
+
+### Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Add tests for new features
+4. Update documentation
+5. Submit a pull request
+
+See **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** for development guidelines.
+
+## Specifications
+
+| Parameter | Range |
+|-----------|-------|
+| **Frequency** | 70 MHz - 6 GHz |
+| **Sample Rate** | 2.084 - 61.44 MSPS |
+| **Gain** | 0 - 73 dB |
+| **Ports** | 4990 (config), 4991 (data) |
+| **Protocol** | VITA 49.0 |
+| **Transport** | UDP over Ethernet/WiFi |
 
 ## License
 
-MIT License
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Built with [libiio](https://wiki.analog.com/resources/tools-software/linux-software/libiio)
+- VITA 49.0 standard by [VITA](https://www.vita.com)
+- Designed for [ADALM-Pluto SDR](https://www.analog.com/en/design-center/evaluation-hardware-and-software/evaluation-boards-kits/adalm-pluto.html)
+
+## Support
+
+- **Documentation**: See [docs/](docs/) directory
+- **Issues**: Open an issue on GitHub
+- **Questions**: Check [docs/USAGE.md](docs/USAGE.md) FAQ section
+
+---
+
+**Ready to stream?** Follow the [Quick Start Guide](docs/USAGE.md)
