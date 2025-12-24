@@ -70,6 +70,7 @@ typedef struct {
     uint32_t sample_rate_hz;
     uint32_t bandwidth_hz;
     double gain_db;
+    bool config_changed;  /* Flag to signal streaming thread to reconfigure */
     pthread_mutex_t mutex;
 } sdr_config_t;
 
@@ -78,6 +79,7 @@ static sdr_config_t g_sdr_config = {
     .sample_rate_hz = DEFAULT_RATE_HZ,
     .bandwidth_hz = DEFAULT_RATE_HZ * 0.8,
     .gain_db = DEFAULT_GAIN_DB,
+    .config_changed = false,
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
@@ -114,6 +116,7 @@ typedef struct {
 /* Function prototypes */
 static void signal_handler(int sig);
 static void add_subscriber(struct sockaddr_in *addr);
+static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len);
 static uint64_t get_timestamp_us(void);
 static void encode_context_packet(uint8_t *buf, size_t *len);
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count);
@@ -170,6 +173,19 @@ static void add_subscriber(struct sockaddr_in *addr) {
                ip_str, ntohs(addr->sin_port), g_subscriber_count);
     }
 
+    pthread_mutex_unlock(&g_subscribers_mutex);
+}
+
+/* Broadcast packet to all active subscribers */
+static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len) {
+    pthread_mutex_lock(&g_subscribers_mutex);
+    for (int i = 0; i < g_subscriber_count; i++) {
+        if (g_subscribers[i].active) {
+            sendto(sock, buf, len, 0,
+                  (struct sockaddr *)&g_subscribers[i].addr,
+                  sizeof(g_subscribers[i].addr));
+        }
+    }
     pthread_mutex_unlock(&g_subscribers_mutex);
 }
 
@@ -400,13 +416,17 @@ static void *control_thread(void *arg) {
                 changed = true;
             }
 
+            /* Set flag to notify streaming thread to apply changes */
+            if (changed) {
+                g_sdr_config.config_changed = true;
+            }
+
             pthread_mutex_unlock(&g_sdr_config.mutex);
 
             if (!changed) {
                 printf("[Control] No changes (same as current config)\n");
             } else {
-                printf("[Control] Configuration updated successfully\n");
-                /* Note: Actual SDR reconfiguration happens in streaming thread */
+                printf("[Control] Configuration updated - streaming thread will apply changes\n");
             }
         } else {
             printf("[Control] Warning: Failed to parse context packet\n");
@@ -461,8 +481,69 @@ static void *streaming_thread(void *arg) {
     int packets_since_context = 0;
     uint8_t packet_buf[8192];
     size_t packet_len;
+    uint64_t last_config_check_us = get_timestamp_us();
 
     while (g_running) {
+        /* Check for configuration changes every 100ms */
+        uint64_t now_us = get_timestamp_us();
+        if (now_us - last_config_check_us >= 100000) {  /* 100ms = 100,000 microseconds */
+            last_config_check_us = now_us;
+
+            pthread_mutex_lock(&g_sdr_config.mutex);
+            bool needs_reconfig = g_sdr_config.config_changed;
+            pthread_mutex_unlock(&g_sdr_config.mutex);
+
+            if (needs_reconfig) {
+                printf("[Streaming] ========================================\n");
+                printf("[Streaming] Configuration change detected - applying to hardware\n");
+
+                /* Destroy current buffer */
+                iio_buffer_destroy(rxbuf);
+                rxbuf = NULL;
+
+                /* Apply new configuration to SDR hardware */
+                if (configure_sdr(ctx, dev) < 0) {
+                    fprintf(stderr, "[Streaming] ERROR: Failed to apply new configuration\n");
+                    fprintf(stderr, "[Streaming] ERROR: Keeping old configuration\n");
+
+                    /* Try to recreate buffer with old settings */
+                    rxbuf = iio_device_create_buffer(dev, DEFAULT_BUFFER_SIZE, false);
+                    if (!rxbuf) {
+                        fprintf(stderr, "[Streaming] FATAL: Cannot recreate buffer - stopping\n");
+                        break;
+                    }
+
+                    pthread_mutex_lock(&g_sdr_config.mutex);
+                    g_sdr_config.config_changed = false;
+                    pthread_mutex_unlock(&g_sdr_config.mutex);
+                    continue;
+                }
+
+                /* Recreate buffer with new configuration */
+                rxbuf = iio_device_create_buffer(dev, DEFAULT_BUFFER_SIZE, false);
+                if (!rxbuf) {
+                    fprintf(stderr, "[Streaming] FATAL: Failed to recreate buffer - stopping\n");
+                    break;
+                }
+
+                /* Clear the flag */
+                pthread_mutex_lock(&g_sdr_config.mutex);
+                g_sdr_config.config_changed = false;
+                pthread_mutex_unlock(&g_sdr_config.mutex);
+
+                /* Send Context packet to notify all subscribers of the change */
+                encode_context_packet(packet_buf, &packet_len);
+                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                g_stats.contexts_sent++;
+
+                printf("[Streaming] Configuration applied successfully\n");
+                printf("[Streaming] Notified %d subscribers of config change\n", g_subscriber_count);
+                printf("[Streaming] ========================================\n");
+
+                packets_since_context = 0;  /* Reset counter */
+            }
+        }
+
         /* Refill buffer */
         ssize_t nbytes = iio_buffer_refill(rxbuf);
         if (nbytes < 0) {
@@ -479,17 +560,7 @@ static void *streaming_thread(void *arg) {
         /* Send context packet periodically */
         if (packets_since_context >= CONTEXT_INTERVAL) {
             encode_context_packet(packet_buf, &packet_len);
-
-            pthread_mutex_lock(&g_subscribers_mutex);
-            for (int i = 0; i < g_subscriber_count; i++) {
-                if (g_subscribers[i].active) {
-                    sendto(data_sock, packet_buf, packet_len, 0,
-                          (struct sockaddr *)&g_subscribers[i].addr,
-                          sizeof(g_subscribers[i].addr));
-                }
-            }
-            pthread_mutex_unlock(&g_subscribers_mutex);
-
+            broadcast_to_subscribers(data_sock, packet_buf, packet_len);
             g_stats.contexts_sent++;
             packets_since_context = 0;
         }
@@ -502,15 +573,7 @@ static void *streaming_thread(void *arg) {
             encode_data_packet(packet_buf, &packet_len, samples + offset * 2,
                              chunk_size, &packet_count);
 
-            pthread_mutex_lock(&g_subscribers_mutex);
-            for (int i = 0; i < g_subscriber_count; i++) {
-                if (g_subscribers[i].active) {
-                    sendto(data_sock, packet_buf, packet_len, 0,
-                          (struct sockaddr *)&g_subscribers[i].addr,
-                          sizeof(g_subscribers[i].addr));
-                }
-            }
-            pthread_mutex_unlock(&g_subscribers_mutex);
+            broadcast_to_subscribers(data_sock, packet_buf, packet_len);
 
             g_stats.packets_sent++;
             g_stats.bytes_sent += packet_len;
