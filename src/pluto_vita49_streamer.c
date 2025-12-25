@@ -214,22 +214,37 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     cif |= (1 << 21);  /* sample_rate */
     cif |= (1 << 23);  /* gain */
 
-    /* Encode context fields (64-bit fixed point, 20-bit radix for Hz) */
+    /* Encode context fields in DESCENDING CIF bit order (VITA49 requirement)
+     * Bit 29: Bandwidth
+     * Bit 27: RF Reference Frequency
+     * Bit 23: Gain (comes BEFORE bit 21!)
+     * Bit 21: Sample Rate
+     */
     int64_t bw_fixed = (int64_t)(bw * (1 << 20));
     int64_t freq_fixed = (int64_t)(freq * (1 << 20));
     int64_t rate_fixed = (int64_t)(rate * (1 << 20));
     int16_t gain_fixed = (int16_t)(gain * 128);
 
     uint64_t *p64 = (uint64_t *)payload;
-    p64[0] = htonll(bw_fixed);
-    p64[1] = htonll(freq_fixed);
-    p64[2] = htonll(rate_fixed);
-    payload_len += 24;
 
+    /* Bit 29: Bandwidth (64-bit, 20-bit radix) */
+    p64[0] = htonll(bw_fixed);
+    payload_len += 8;
+
+    /* Bit 27: RF Reference Frequency (64-bit, 20-bit radix) */
+    p64[1] = htonll(freq_fixed);
+    payload_len += 8;
+
+    /* Bit 23: Gain - Stage 1 and Stage 2 (two 16-bit values, 7-bit radix) */
     uint16_t *p16 = (uint16_t *)(payload + payload_len);
-    p16[0] = htons(gain_fixed);
-    p16[1] = 0;
+    p16[0] = htons(gain_fixed);  /* Stage 1 */
+    p16[1] = 0;                   /* Stage 2 (unused) */
     payload_len += 4;
+
+    /* Bit 21: Sample Rate (64-bit, 20-bit radix) */
+    p64 = (uint64_t *)(payload + payload_len);
+    p64[0] = htonll(rate_fixed);
+    payload_len += 8;
 
     /* Calculate packet size in 32-bit words */
     size_t total_words = 1 + 1 + 1 + 2 + 1 + (payload_len / 4);
