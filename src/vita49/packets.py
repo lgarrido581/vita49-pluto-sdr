@@ -650,19 +650,20 @@ class VRTContextPacket:
 
         parts.append(self.cif.encode())
 
-        # Encode context fields in order
+        # Encode context fields in DESCENDING CIF bit order (VITA49 requirement)
         if self.cif.bandwidth:
             parts.append(self._encode_fixed_point_64(self.bandwidth_hz))
         if self.cif.if_reference_frequency:
             parts.append(self._encode_fixed_point_64(self.if_reference_frequency_hz))
         if self.cif.rf_reference_frequency:
             parts.append(self._encode_fixed_point_64(self.rf_reference_frequency_hz))
-        if self.cif.sample_rate:
-            parts.append(self._encode_fixed_point_64(self.sample_rate_hz))
+        # NOTE: Bit 23 (gain) comes BEFORE bit 21 (sample_rate) in descending order!
         if self.cif.gain:
             # Stage 1 and Stage 2 gain (both 16-bit, 7-bit radix)
             stage1 = int(self.gain_db * 128)  # 7-bit radix
             parts.append(struct.pack('>hh', stage1, 0))  # Stage2 = 0
+        if self.cif.sample_rate:
+            parts.append(self._encode_fixed_point_64(self.sample_rate_hz))
         if self.cif.reference_level:
             ref_level = int(self.reference_level_dbm * 128)
             parts.append(struct.pack('>i', ref_level << 16))
@@ -746,17 +747,18 @@ class VRTContextPacket:
             rf_reference_frequency_hz = fixed_val / (1 << 20)
             offset += 8
 
+        # Gain (two 16-bit values, 7-bit radix)
+        # NOTE: Bit 23 comes BEFORE bit 21 in descending CIF order!
+        if cif.gain:
+            stage1, stage2 = struct.unpack('>hh', data[offset:offset+4])
+            gain_db = stage1 / 128.0  # 7-bit radix
+            offset += 4
+
         # Sample rate
         if cif.sample_rate:
             fixed_val = struct.unpack('>q', data[offset:offset+8])[0]
             sample_rate_hz = fixed_val / (1 << 20)
             offset += 8
-
-        # Gain (two 16-bit values, 7-bit radix)
-        if cif.gain:
-            stage1, stage2 = struct.unpack('>hh', data[offset:offset+4])
-            gain_db = stage1 / 128.0  # 7-bit radix
-            offset += 4
 
         # Reference level
         if cif.reference_level:
