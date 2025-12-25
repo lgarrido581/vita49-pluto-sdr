@@ -222,9 +222,9 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
      *
      * NOTE: Use memcpy to avoid alignment issues with uint64_t at non-8-byte offsets
      */
-    int64_t bw_fixed = (int64_t)(bw * (1 << 20));
-    int64_t freq_fixed = (int64_t)(freq * (1 << 20));
-    int64_t rate_fixed = (int64_t)(rate * (1 << 20));
+    int64_t bw_fixed = ((int64_t)bw * (1 << 20));
+    int64_t freq_fixed = ((int64_t)freq * (1 << 20));
+    int64_t rate_fixed = ((int64_t)rate * (1 << 20));
     int16_t gain_fixed = (int16_t)(gain * 128);
 
     /* Bit 29: Bandwidth (64-bit, 20-bit radix) */
