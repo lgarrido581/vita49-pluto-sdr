@@ -159,7 +159,10 @@ class VITA49WebHandler:
         # Processing
         self._last_broadcast_time = 0.0
         self._broadcast_interval = 1.0 / self.update_rate_hz
-        self._spectrum_avg_buffer = []
+        self._spectrum_avg_buffer = deque(maxlen=self.averaging)
+        self._pending_broadcast = False
+        self._spectrum_sequence = 0
+        self._waterfall_sequence = 0
 
     def start(self, port: int = 4991):
         """Start VITA49 stream reception"""
@@ -295,63 +298,88 @@ class VITA49WebHandler:
 
     async def _process_and_broadcast(self):
         """Process samples and broadcast to clients"""
+        # Frame dropping: Skip if previous broadcast is still pending
+        if self._pending_broadcast:
+            logger.debug("Skipping frame - previous broadcast still pending")
+            return
+
         if len(self.sample_buffer) < self.fft_size:
             return
 
-        # Get samples
-        samples = np.array(list(self.sample_buffer)[-self.fft_size:])
+        self._pending_broadcast = True
+        try:
+            # Get samples - optimize by avoiding list() conversion
+            # Convert deque directly to numpy array for better performance
+            samples = np.array(self.sample_buffer)[-self.fft_size:]
 
-        # Compute FFT
-        window = np.hanning(len(samples))
-        spectrum = np.fft.fftshift(np.fft.fft(samples * window))
-        spectrum_mag = np.abs(spectrum)
-        spectrum_db = 20 * np.log10(spectrum_mag + 1e-10)
+            # Compute FFT
+            window = np.hanning(len(samples))
+            spectrum = np.fft.fftshift(np.fft.fft(samples * window))
+            spectrum_mag = np.abs(spectrum)
+            spectrum_db = 20 * np.log10(spectrum_mag + 1e-10)
 
-        # Apply averaging
-        self._spectrum_avg_buffer.append(spectrum_db)
-        if len(self._spectrum_avg_buffer) > self.averaging:
-            self._spectrum_avg_buffer.pop(0)
+            # Apply averaging - deque with maxlen auto-pops oldest (O(1) operation)
+            self._spectrum_avg_buffer.append(spectrum_db)
 
-        if len(self._spectrum_avg_buffer) > 0:
-            spectrum_db_avg = np.mean(self._spectrum_avg_buffer, axis=0)
-        else:
-            spectrum_db_avg = spectrum_db
+            if len(self._spectrum_avg_buffer) > 0:
+                spectrum_db_avg = np.mean(self._spectrum_avg_buffer, axis=0)
+            else:
+                spectrum_db_avg = spectrum_db
 
-        # Compute frequency bins
-        freq_bins = np.fft.fftshift(
-            np.fft.fftfreq(len(samples), 1/self.metadata['sample_rate_hz'])
-        ) / 1e6  # Convert to MHz
+            # Compute frequency bins
+            freq_bins = np.fft.fftshift(
+                np.fft.fftfreq(len(samples), 1/self.metadata['sample_rate_hz'])
+            ) / 1e6  # Convert to MHz
 
-        # Calculate signal statistics
-        signal_power_dbfs = 10 * np.log10(np.mean(np.abs(samples)**2) + 1e-10)
-        noise_floor_db = float(np.percentile(spectrum_db_avg, 10))
-        peak_power_db = float(np.percentile(spectrum_db_avg, 99))
+            # Calculate signal statistics
+            signal_power_dbfs = 10 * np.log10(np.mean(np.abs(samples)**2) + 1e-10)
+            noise_floor_db = float(np.percentile(spectrum_db_avg, 10))
+            peak_power_db = float(np.percentile(spectrum_db_avg, 99))
 
-        # Add to waterfall
-        self.waterfall_buffer.append(spectrum_db_avg.tolist())
+            # Optimize: Convert to lists once and reuse
+            freq_decimated = freq_bins[::4].tolist()
+            spectrum_decimated = spectrum_db_avg[::4].tolist()
+            time_i_decimated = samples.real[::8].tolist()
+            time_q_decimated = samples.imag[::8].tolist()
 
-        # Broadcast spectrum data
-        await self.manager.broadcast({
-            'type': 'spectrum',
-            'data': {
-                'frequencies': freq_bins.tolist()[::4],  # Decimate for bandwidth
-                'spectrum': spectrum_db_avg.tolist()[::4],
-                'signal_power_dbfs': signal_power_dbfs,
-                'noise_floor_db': noise_floor_db,
-                'peak_power_db': peak_power_db,
-                'time_domain_i': samples.real.tolist()[::8],  # More decimation for time domain
-                'time_domain_q': samples.imag.tolist()[::8]
-            }
-        })
+            # Add to waterfall (store as list for efficient serialization later)
+            self.waterfall_buffer.append(spectrum_decimated)
 
-        # Broadcast waterfall periodically (every 5 spectrums to reduce bandwidth)
-        if self.stats['packets_received'] % 5 == 0:
+            # Increment sequence number
+            self._spectrum_sequence += 1
+            current_time = time.time()
+
+            # Broadcast spectrum data with sequence number and timestamp
             await self.manager.broadcast({
-                'type': 'waterfall',
+                'type': 'spectrum',
+                'sequence': self._spectrum_sequence,
+                'timestamp': current_time,
                 'data': {
-                    'waterfall': list(self.waterfall_buffer)
+                    'frequencies': freq_decimated,
+                    'spectrum': spectrum_decimated,
+                    'signal_power_dbfs': signal_power_dbfs,
+                    'noise_floor_db': noise_floor_db,
+                    'peak_power_db': peak_power_db,
+                    'time_domain_i': time_i_decimated,
+                    'time_domain_q': time_q_decimated
                 }
             })
+
+            # Broadcast waterfall periodically (every 5 spectrums to reduce bandwidth)
+            if self.stats['packets_received'] % 5 == 0:
+                self._waterfall_sequence += 1
+                await self.manager.broadcast({
+                    'type': 'waterfall',
+                    'sequence': self._waterfall_sequence,
+                    'timestamp': current_time,
+                    'data': {
+                        'waterfall': list(self.waterfall_buffer)
+                    }
+                })
+
+        finally:
+            # Reset pending flag
+            self._pending_broadcast = False
 
     def get_stats(self) -> dict:
         """Get current statistics"""
@@ -416,48 +444,84 @@ async def get_status():
     })
 
 
-@app.post("/api/config")
-async def set_config(config: PlutoConfig):
-    """Configure Pluto SDR parameters"""
-    global current_config
-
+async def _send_config_async(config: PlutoConfig):
+    """Send configuration to Pluto in background (non-blocking)"""
     try:
-        # Store configuration
-        current_config = config
-
         # Extract Pluto IP from URI (format: "ip:pluto.local" or "ip:192.168.2.1")
         pluto_ip = config.pluto_uri.replace("ip:", "").replace("usb:", "")
 
-        # Send configuration to Pluto via VITA49 Context packet
-        client = VITA49ConfigClient(
-            pluto_ip=pluto_ip,
-            control_port=4990,
-            data_port=4991
-        )
+        # Run blocking I/O in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
 
-        success = client.configure(
-            sample_rate_hz=config.sample_rate_hz,
-            center_freq_hz=config.center_freq_hz,
-            bandwidth_hz=config.bandwidth_hz,
-            gain_db=config.rx_gain_db
-        )
+        def send_config():
+            client = VITA49ConfigClient(
+                pluto_ip=pluto_ip,
+                control_port=4990,
+                data_port=4991
+            )
 
-        client.close()
+            success = client.configure(
+                sample_rate_hz=config.sample_rate_hz,
+                center_freq_hz=config.center_freq_hz,
+                bandwidth_hz=config.bandwidth_hz,
+                gain_db=config.rx_gain_db
+            )
 
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to send configuration to Pluto")
+            client.close()
+            return success
 
-        logger.info(f"Configuration sent to Pluto: {config.center_freq_hz/1e9:.3f} GHz, "
-                   f"{config.sample_rate_hz/1e6:.1f} MSPS, {config.rx_gain_db} dB")
+        # Execute in thread pool
+        success = await loop.run_in_executor(None, send_config)
 
+        if success:
+            logger.info(f"Configuration applied: {config.center_freq_hz/1e9:.3f} GHz, "
+                       f"{config.sample_rate_hz/1e6:.1f} MSPS, {config.rx_gain_db} dB")
+
+            # Broadcast success to all connected clients
+            await manager.broadcast({
+                'type': 'config_applied',
+                'success': True,
+                'config': config.dict()
+            })
+        else:
+            logger.error("Failed to send configuration to Pluto")
+            await manager.broadcast({
+                'type': 'config_applied',
+                'success': False,
+                'error': 'Failed to send configuration to Pluto'
+            })
+
+    except Exception as e:
+        logger.error(f"Error in async config send: {e}")
+        await manager.broadcast({
+            'type': 'config_applied',
+            'success': False,
+            'error': str(e)
+        })
+
+
+@app.post("/api/config")
+async def set_config(config: PlutoConfig):
+    """Configure Pluto SDR parameters (non-blocking)"""
+    global current_config
+
+    try:
+        # Store configuration immediately
+        current_config = config
+
+        # Start async task (non-blocking)
+        asyncio.create_task(_send_config_async(config))
+
+        # Return immediately with pending status
         return JSONResponse({
             'success': True,
-            'message': 'Configuration sent to Pluto',
+            'status': 'pending',
+            'message': 'Configuration update queued - will be applied shortly',
             'config': config.dict()
         })
 
     except Exception as e:
-        logger.error(f"Error setting configuration: {e}")
+        logger.error(f"Error queueing configuration: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -504,6 +568,9 @@ async def set_spectrum_config(config: SpectrumConfig):
     handler.update_rate_hz = config.update_rate_hz
     handler.averaging = config.averaging
     handler._broadcast_interval = 1.0 / config.update_rate_hz
+
+    # Update averaging buffer maxlen when averaging changes
+    handler._spectrum_avg_buffer = deque(maxlen=config.averaging)
 
     return JSONResponse({
         'success': True,

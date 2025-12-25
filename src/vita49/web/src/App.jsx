@@ -142,6 +142,7 @@ function App() {
             onConfigChange={handleConfigChange}
             onStreamControl={handleStreamControl}
             status={status}
+            websocket={ws}
           />
         </aside>
 

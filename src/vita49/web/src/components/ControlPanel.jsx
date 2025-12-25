@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { Play, Pause, Settings, Radio, Gauge, Sliders } from 'lucide-react'
 import './ControlPanel.css'
 
-export default function ControlPanel({ onConfigChange, onStreamControl, status }) {
+export default function ControlPanel({ onConfigChange, onStreamControl, status, websocket }) {
   const [config, setConfig] = useState({
     pluto_uri: 'ip:pluto.local',
     center_freq_hz: 2.4e9,
@@ -14,6 +14,7 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
   const [isStreaming, setIsStreaming] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [configInitialized, setConfigInitialized] = useState(false)
+  const [configStatus, setConfigStatus] = useState(null) // 'sending', 'applying', 'success', 'error'
 
   useEffect(() => {
     if (status) {
@@ -32,12 +33,32 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
     }
   }, [status, configInitialized])
 
+  // Listen for config_applied messages from WebSocket
+  useEffect(() => {
+    if (!websocket) return
+
+    const cleanup = websocket.on('config_applied', (data) => {
+      if (data.success) {
+        setConfigStatus('success')
+        setTimeout(() => setConfigStatus(null), 2000)
+      } else {
+        setConfigStatus('error')
+        console.error('Config application failed:', data.error)
+        setTimeout(() => setConfigStatus(null), 3000)
+      }
+    })
+
+    return cleanup
+  }, [websocket])
+
   const handleChange = (field, value) => {
     setConfig(prev => ({ ...prev, [field]: value }))
   }
 
-  const handleApply = () => {
-    onConfigChange(config)
+  const handleApply = async () => {
+    setConfigStatus('sending')
+    await onConfigChange(config)
+    setConfigStatus('applying')
   }
 
   const handleStreamToggle = () => {
@@ -204,10 +225,15 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
           {showAdvanced ? 'Hide' : 'Show'} Advanced
         </button>
         <button
-          className="apply-btn"
+          className={`apply-btn ${configStatus ? 'status-' + configStatus : ''}`}
           onClick={handleApply}
+          disabled={configStatus === 'sending' || configStatus === 'applying'}
         >
-          Apply Configuration
+          {configStatus === 'sending' && '⏳ Sending...'}
+          {configStatus === 'applying' && '⏳ Applying...'}
+          {configStatus === 'success' && '✓ Applied!'}
+          {configStatus === 'error' && '✗ Failed'}
+          {!configStatus && 'Apply Configuration'}
         </button>
       </div>
 
