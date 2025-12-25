@@ -250,6 +250,16 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     memcpy(payload + payload_len, &rate_be, 8);
     payload_len += 8;
 
+    /* DEBUG: Log what we're encoding */
+    static int debug_count = 0;
+    if (debug_count++ < 5) {  /* Only log first 5 packets */
+        printf("[DEBUG] Encoding context: freq=%.1f MHz, rate=%.1f MSPS, gain=%.1f dB\n",
+               freq / 1e6, rate / 1e6, gain);
+        printf("[DEBUG] Fixed-point: freq=%lld, rate=%lld, gain=%d\n",
+               (long long)freq_fixed, (long long)rate_fixed, gain_fixed);
+        printf("[DEBUG] Payload length: %zu bytes\n", payload_len);
+    }
+
     /* Calculate packet size in 32-bit words */
     size_t total_words = 1 + 1 + 1 + 2 + 1 + (payload_len / 4);
 
