@@ -450,28 +450,40 @@ async def _send_config_async(config: PlutoConfig):
         # Extract Pluto IP from URI (format: "ip:pluto.local" or "ip:192.168.2.1")
         pluto_ip = config.pluto_uri.replace("ip:", "").replace("usb:", "")
 
+        logger.info(f"Starting async config send to {pluto_ip}: "
+                   f"{config.center_freq_hz/1e9:.3f} GHz, {config.sample_rate_hz/1e6:.1f} MSPS")
+
         # Run blocking I/O in thread pool to avoid blocking event loop
         loop = asyncio.get_event_loop()
 
         def send_config():
-            client = VITA49ConfigClient(
-                pluto_ip=pluto_ip,
-                control_port=4990,
-                data_port=4991
-            )
+            try:
+                logger.debug(f"Thread pool: Creating VITA49ConfigClient for {pluto_ip}")
+                client = VITA49ConfigClient(
+                    pluto_ip=pluto_ip,
+                    control_port=4990,
+                    data_port=4991
+                )
 
-            success = client.configure(
-                sample_rate_hz=config.sample_rate_hz,
-                center_freq_hz=config.center_freq_hz,
-                bandwidth_hz=config.bandwidth_hz,
-                gain_db=config.rx_gain_db
-            )
+                logger.debug("Thread pool: Calling configure()")
+                success = client.configure(
+                    sample_rate_hz=config.sample_rate_hz,
+                    center_freq_hz=config.center_freq_hz,
+                    bandwidth_hz=config.bandwidth_hz,
+                    gain_db=config.rx_gain_db
+                )
 
-            client.close()
-            return success
+                logger.debug(f"Thread pool: configure() returned {success}")
+                client.close()
+                return success
+            except Exception as e:
+                logger.error(f"Thread pool exception: {e}", exc_info=True)
+                return False
 
         # Execute in thread pool
+        logger.debug("Submitting to thread pool...")
         success = await loop.run_in_executor(None, send_config)
+        logger.debug(f"Thread pool completed with success={success}")
 
         if success:
             logger.info(f"Configuration applied: {config.center_freq_hz/1e9:.3f} GHz, "
@@ -480,23 +492,29 @@ async def _send_config_async(config: PlutoConfig):
             # Broadcast success to all connected clients
             await manager.broadcast({
                 'type': 'config_applied',
-                'success': True,
-                'config': config.dict()
+                'data': {
+                    'success': True,
+                    'config': config.dict()
+                }
             })
         else:
             logger.error("Failed to send configuration to Pluto")
             await manager.broadcast({
                 'type': 'config_applied',
-                'success': False,
-                'error': 'Failed to send configuration to Pluto'
+                'data': {
+                    'success': False,
+                    'error': 'Failed to send configuration to Pluto'
+                }
             })
 
     except Exception as e:
         logger.error(f"Error in async config send: {e}")
         await manager.broadcast({
             'type': 'config_applied',
-            'success': False,
-            'error': str(e)
+            'data': {
+                'success': False,
+                'error': str(e)
+            }
         })
 
 
