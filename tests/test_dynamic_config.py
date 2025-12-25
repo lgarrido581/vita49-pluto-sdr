@@ -80,12 +80,16 @@ def encode_context_packet(config: Config, stream_id: int = 0x01000000) -> bytes:
     rate_fixed = int(config.rate_hz * (1 << 20))
     gain_fixed = int(config.gain_db * 128)  # 7-bit radix
 
-    # Build payload
+    # Build payload in DESCENDING CIF bit order (VITA49 requirement)
+    # Bit 29: Bandwidth
+    # Bit 27: RF Reference Frequency
+    # Bit 23: Gain (comes BEFORE bit 21!)
+    # Bit 21: Sample Rate
     payload = b''
-    payload += struct.pack('>q', bw_fixed)      # bandwidth (8 bytes)
-    payload += struct.pack('>q', freq_fixed)    # rf_frequency (8 bytes)
-    payload += struct.pack('>q', rate_fixed)    # sample_rate (8 bytes)
-    payload += struct.pack('>hh', gain_fixed, 0)  # gain stage1, stage2 (4 bytes)
+    payload += struct.pack('>q', bw_fixed)       # Bit 29: bandwidth (8 bytes)
+    payload += struct.pack('>q', freq_fixed)     # Bit 27: rf_frequency (8 bytes)
+    payload += struct.pack('>hh', gain_fixed, 0) # Bit 23: gain stage1, stage2 (4 bytes)
+    payload += struct.pack('>q', rate_fixed)     # Bit 21: sample_rate (8 bytes)
 
     # Calculate packet size in 32-bit words
     # header(1) + stream_id(1) + ts_int(1) + ts_frac(2) + cif(1) + payload
