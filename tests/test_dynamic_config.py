@@ -245,6 +245,10 @@ def verify_config_applied(dest_ip: str, expected_config: Config, timeout: float 
     """
     Verify that configuration was applied by receiving a context packet.
 
+    This function will keep receiving context packets until it finds one that matches
+    the expected configuration, or until timeout. This handles the case where stale
+    context packets from previous configurations are still in flight.
+
     Args:
         dest_ip: Streamer IP address
         expected_config: Expected configuration
@@ -261,38 +265,78 @@ def verify_config_applied(dest_ip: str, expected_config: Config, timeout: float 
         sock.bind(('0.0.0.0', DATA_PORT))
         close_sock = True
 
-    print(f"  Waiting for context packet (timeout: {timeout}s)...")
+    print(f"  Waiting for matching context packet (timeout: {timeout}s)...")
+    print(f"  (Will skip stale packets until we find matching config)")
 
-    received_config = receive_context_packet(sock, timeout)
+    sock.settimeout(timeout)
+    start_time = time.time()
+    packets_received = 0
+    last_received_config = None
 
+    while time.time() - start_time < timeout:
+        try:
+            data, addr = sock.recvfrom(8192)
+
+            # Check if it's a context packet
+            if len(data) < 4:
+                continue
+
+            header = struct.unpack('>I', data[0:4])[0]
+            packet_type = (header >> 28) & 0xF
+
+            if packet_type == VRT_PKT_TYPE_CONTEXT:
+                received_config = parse_context_packet(data)
+                if received_config:
+                    packets_received += 1
+                    last_received_config = received_config
+
+                    # Compare configurations (allow small tolerance for floating point)
+                    freq_match = abs(received_config.freq_hz - expected_config.freq_hz) < 1000  # 1 kHz tolerance
+                    rate_match = abs(received_config.rate_hz - expected_config.rate_hz) < 1000  # 1 kHz tolerance
+                    gain_match = abs(received_config.gain_db - expected_config.gain_db) < 0.1   # 0.1 dB tolerance
+
+                    if freq_match and rate_match and gain_match:
+                        # Found matching config!
+                        print(f"  ✓ Config verified (after {packets_received} context packet(s)):")
+                        print(f"    Frequency: {received_config.freq_hz/1e6:.1f} MHz")
+                        print(f"    Rate:      {received_config.rate_hz/1e6:.1f} MSPS")
+                        print(f"    Gain:      {received_config.gain_db:.1f} dB")
+                        if close_sock:
+                            sock.close()
+                        return True
+                    else:
+                        # Config doesn't match - this is a stale packet
+                        print(f"  → Skipping stale packet #{packets_received}: "
+                              f"{received_config.freq_hz/1e6:.1f} MHz, "
+                              f"{received_config.rate_hz/1e6:.1f} MSPS, "
+                              f"{received_config.gain_db:.1f} dB")
+
+        except socket.timeout:
+            break
+        except Exception as e:
+            print(f"  Warning: Error receiving packet: {e}")
+            continue
+
+    # Timeout - no matching config found
     if close_sock:
         sock.close()
 
-    if not received_config:
-        print("  ✗ No context packet received")
+    if packets_received == 0:
+        print("  ✗ No context packets received")
         print("  Possible issues:")
         print("    - C streamer not running")
         print("    - Streamer not sending data yet (no SDR connected?)")
         print("    - Firewall blocking UDP port 4991")
         print("    - Streamer on different IP address")
-        return False
-
-    # Compare configurations (allow small tolerance for floating point)
-    freq_match = abs(received_config.freq_hz - expected_config.freq_hz) < 1000  # 1 kHz tolerance
-    rate_match = abs(received_config.rate_hz - expected_config.rate_hz) < 1000  # 1 kHz tolerance
-    gain_match = abs(received_config.gain_db - expected_config.gain_db) < 0.1   # 0.1 dB tolerance
-
-    if freq_match and rate_match and gain_match:
-        print(f"  ✓ Config verified:")
-        print(f"    Frequency: {received_config.freq_hz/1e6:.1f} MHz")
-        print(f"    Rate:      {received_config.rate_hz/1e6:.1f} MSPS")
-        print(f"    Gain:      {received_config.gain_db:.1f} dB")
-        return True
     else:
-        print(f"  ✗ Config mismatch!")
-        print(f"    Expected: {expected_config.freq_hz/1e6:.1f} MHz, {expected_config.rate_hz/1e6:.1f} MSPS, {expected_config.gain_db:.1f} dB")
-        print(f"    Received: {received_config.freq_hz/1e6:.1f} MHz, {received_config.rate_hz/1e6:.1f} MSPS, {received_config.gain_db:.1f} dB")
-        return False
+        print(f"  ✗ Timeout - received {packets_received} context packet(s) but none matched")
+        if last_received_config:
+            print(f"  Last received config:")
+            print(f"    Frequency: {last_received_config.freq_hz/1e6:.1f} MHz (expected {expected_config.freq_hz/1e6:.1f} MHz)")
+            print(f"    Rate:      {last_received_config.rate_hz/1e6:.1f} MSPS (expected {expected_config.rate_hz/1e6:.1f} MSPS)")
+            print(f"    Gain:      {last_received_config.gain_db:.1f} dB (expected {expected_config.gain_db:.1f} dB)")
+
+    return False
 
 
 def main():
