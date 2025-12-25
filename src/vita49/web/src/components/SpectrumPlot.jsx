@@ -4,7 +4,39 @@ import { Activity } from 'lucide-react'
 import './SpectrumPlot.css'
 
 export default function SpectrumPlot({ spectrumData, metadata }) {
-  const [layout, setLayout] = useState(null)
+  // Initialize layout with default values immediately
+  const [layout, setLayout] = useState({
+    autosize: true,
+    margin: { l: 50, r: 20, t: 40, b: 50 },
+    paper_bgcolor: '#131820',
+    plot_bgcolor: '#0a0e17',
+    font: {
+      family: 'Inter, sans-serif',
+      size: 11,
+      color: '#a0a8b8'
+    },
+    title: {
+      text: 'Spectrum',
+      font: { size: 14, color: '#e8eaf0' },
+      x: 0.05,
+      xanchor: 'left'
+    },
+    xaxis: {
+      title: 'Frequency Offset (MHz)',
+      gridcolor: '#2a3142',
+      zerolinecolor: '#2a3142',
+      color: '#a0a8b8',
+      range: [-15, 15]  // Default range for 30 MHz
+    },
+    yaxis: {
+      title: 'Power (dBFS)',
+      gridcolor: '#2a3142',
+      zerolinecolor: '#2a3142',
+      color: '#a0a8b8'
+    },
+    hovermode: 'closest',
+    showlegend: false
+  })
   const [config] = useState({
     displayModeBar: false,
     responsive: true
@@ -12,11 +44,10 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
   const [maxHoldEnabled, setMaxHoldEnabled] = useState(false)
   const [maxHoldData, setMaxHoldData] = useState(null)
 
+  // Update layout when metadata becomes available
   useEffect(() => {
-    if (!metadata) return
-
-    const sampleRate = metadata.sample_rate_hz || 30e6
-    const centerFreq = metadata.center_freq_hz || 2.4e9
+    const sampleRate = metadata?.sample_rate_hz || 30e6
+    const centerFreq = metadata?.center_freq_hz || 2.4e9
 
     setLayout({
       autosize: true,
@@ -86,7 +117,7 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
     setMaxHoldData(null)
   }
 
-  if (!spectrumData || !spectrumData.frequencies || !spectrumData.spectrum || !layout) {
+  if (!spectrumData || !spectrumData.frequencies || !spectrumData.spectrum) {
     return (
       <div className="spectrum-plot card">
         <div className="plot-header">

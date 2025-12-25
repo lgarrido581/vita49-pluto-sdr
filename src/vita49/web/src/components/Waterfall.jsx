@@ -4,16 +4,44 @@ import { Waves } from 'lucide-react'
 import './Waterfall.css'
 
 export default function Waterfall({ waterfallData, metadata }) {
-  const [layout, setLayout] = useState(null)
+  // Initialize layout with default values immediately
+  const [layout, setLayout] = useState({
+    autosize: true,
+    margin: { l: 50, r: 60, t: 40, b: 50 },
+    paper_bgcolor: '#131820',
+    plot_bgcolor: '#0a0e17',
+    font: {
+      family: 'Inter, sans-serif',
+      size: 11,
+      color: '#a0a8b8'
+    },
+    title: {
+      text: 'Waterfall (Spectrogram)',
+      font: { size: 14, color: '#e8eaf0' },
+      x: 0.05,
+      xanchor: 'left'
+    },
+    xaxis: {
+      title: 'Frequency Offset (MHz)',
+      gridcolor: '#2a3142',
+      color: '#a0a8b8',
+      range: [-15, 15]  // Default range for 30 MHz
+    },
+    yaxis: {
+      title: 'Time',
+      gridcolor: '#2a3142',
+      color: '#a0a8b8',
+      autorange: 'reversed'
+    }
+  })
   const [config] = useState({
     displayModeBar: false,
     responsive: true
   })
 
+  // Update layout when metadata becomes available
   useEffect(() => {
-    if (!metadata) return
-
-    const sampleRate = metadata.sample_rate_hz || 30e6
+    const sampleRate = metadata?.sample_rate_hz || 30e6
 
     setLayout({
       autosize: true,
@@ -46,7 +74,7 @@ export default function Waterfall({ waterfallData, metadata }) {
     })
   }, [metadata])
 
-  if (!waterfallData || !waterfallData.waterfall || waterfallData.waterfall.length === 0 || !layout) {
+  if (!waterfallData || !waterfallData.waterfall || waterfallData.waterfall.length === 0) {
     return (
       <div className="waterfall card">
         <div className="plot-header">
