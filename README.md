@@ -38,6 +38,8 @@ make cross
 ```bash
 # Using SCP (if available)
 scp vita49_streamer root@pluto.local:/root/
+# or following:
+scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null vita49_streamer root@pluto.local:/root/
 
 # Or use WinSCP/MobaXterm for GUI file transfer
 # Connect to pluto.local, user: root, password: analog
@@ -138,11 +140,41 @@ Client      (FFT)      (Energy)   (Custom)
 | **Examples** | Plotting receiver, signal processing harness |
 | **Build Scripts** | Cross-platform build and deployment |
 
+## Web UI
+
+A modern browser-based interface is available for real-time spectrum visualization and control.
+
+### Running the Web UI
+
+**IMPORTANT: You need to run TWO servers simultaneously:**
+
+**Terminal 1 - Backend Server (FastAPI):**
+```bash
+python -m vita49.web_server --host 0.0.0.0 --port 8001
+```
+
+**Terminal 2 - Frontend Dev Server (Vite):**
+```bash
+cd src/vita49/web
+npm install  # First time only
+npm run dev
+```
+
+**Access the UI:**
+- Open browser to http://localhost:3000
+- The Vite dev server (port 3000) proxies API calls to the backend (port 8001)
+
+**Common Error:**
+If you see `ECONNREFUSED` errors in the browser console, it means the backend server (port 8001) is not running. Make sure both servers are running in separate terminals.
+
+See **[QUICKSTART_WEB_UI.md](QUICKSTART_WEB_UI.md)** for detailed setup instructions.
+
 ## Documentation
 
 - **[Quick Start Guide](docs/USAGE.md)** - Deploy and use the streamer
 - **[Build Guide](docs/BUILD.md)** - Build for all platforms (Linux/macOS/Windows)
 - **[Development Guide](docs/DEVELOPMENT.md)** - Architecture, testing, contributing
+- **[Web UI Quick Start](QUICKSTART_WEB_UI.md)** - Browser-based interface setup
 
 ## Installation
 

@@ -222,6 +222,47 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
           )}
         </div>
       )}
+
+      {/* Pluto Status - Show actual values from device */}
+      {status && status.metadata && status.metadata.context_received && (
+        <div className="pluto-status">
+          <h3>Pluto Actual Values:</h3>
+          <div className="status-grid">
+            <div className="status-item">
+              <label>Center Freq:</label>
+              <span className={config.center_freq_hz !== status.metadata.center_freq_hz ? 'mismatch' : ''}>
+                {formatFreq(status.metadata.center_freq_hz)}
+              </span>
+            </div>
+            <div className="status-item">
+              <label>Sample Rate:</label>
+              <span className={config.sample_rate_hz !== status.metadata.sample_rate_hz ? 'mismatch' : ''}>
+                {formatRate(status.metadata.sample_rate_hz)}
+              </span>
+            </div>
+            <div className="status-item">
+              <label>Bandwidth:</label>
+              <span className={config.bandwidth_hz !== status.metadata.bandwidth_hz ? 'mismatch' : ''}>
+                {formatFreq(status.metadata.bandwidth_hz)}
+              </span>
+            </div>
+            <div className="status-item">
+              <label>Gain:</label>
+              <span className={config.rx_gain_db !== status.metadata.gain_db ? 'mismatch' : ''}>
+                {status.metadata.gain_db?.toFixed(1)} dB
+              </span>
+            </div>
+          </div>
+          {(config.center_freq_hz !== status.metadata.center_freq_hz ||
+            config.sample_rate_hz !== status.metadata.sample_rate_hz ||
+            config.bandwidth_hz !== status.metadata.bandwidth_hz ||
+            config.rx_gain_db !== status.metadata.gain_db) && (
+            <div className="config-warning">
+              ⚠️ Settings don't match Pluto's actual values - click "Apply Configuration"
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
