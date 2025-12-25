@@ -175,19 +175,25 @@ def parse_context_packet(data: bytes) -> Optional[Config]:
     return None
 
 
-def send_config(dest_ip: str, config: Config) -> bool:
+def send_config(dest_ip: str, config: Config, source_port: int = DATA_PORT) -> bool:
     """
     Send configuration via VITA49 Context packet.
+
+    IMPORTANT: We bind to DATA_PORT as the source port so the C streamer
+    registers us as a subscriber with the correct address.
 
     Args:
         dest_ip: Destination IP address
         config: Configuration to send
+        source_port: Source port to bind (default: DATA_PORT)
 
     Returns:
         True if successful
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Bind to specific port so C streamer registers us correctly
+        sock.bind(('0.0.0.0', source_port))
         packet = encode_context_packet(config)
         sock.sendto(packet, (dest_ip, CONTROL_PORT))
         sock.close()
@@ -235,7 +241,7 @@ def receive_context_packet(sock: socket.socket, timeout: float = 10.0) -> Option
     return None
 
 
-def verify_config_applied(dest_ip: str, expected_config: Config, timeout: float = 10.0) -> bool:
+def verify_config_applied(dest_ip: str, expected_config: Config, timeout: float = 10.0, sock: socket.socket = None) -> bool:
     """
     Verify that configuration was applied by receiving a context packet.
 
@@ -243,21 +249,32 @@ def verify_config_applied(dest_ip: str, expected_config: Config, timeout: float 
         dest_ip: Streamer IP address
         expected_config: Expected configuration
         timeout: Timeout in seconds
+        sock: Optional existing socket to use (if None, creates new one)
 
     Returns:
         True if config matches
     """
-    # Create socket to receive data packets
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('0.0.0.0', DATA_PORT))
+    # Use existing socket or create new one
+    close_sock = False
+    if sock is None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('0.0.0.0', DATA_PORT))
+        close_sock = True
 
     print(f"  Waiting for context packet (timeout: {timeout}s)...")
 
     received_config = receive_context_packet(sock, timeout)
-    sock.close()
+
+    if close_sock:
+        sock.close()
 
     if not received_config:
         print("  ✗ No context packet received")
+        print("  Possible issues:")
+        print("    - C streamer not running")
+        print("    - Streamer not sending data yet (no SDR connected?)")
+        print("    - Firewall blocking UDP port 4991")
+        print("    - Streamer on different IP address")
         return False
 
     # Compare configurations (allow small tolerance for floating point)
@@ -304,6 +321,23 @@ def main():
     print(f"  Data Port:    {DATA_PORT}")
     print("="*70)
     print()
+    print("IMPORTANT: Make sure the C streamer is running before starting this test!")
+    print("           Start it with: ./vita49_streamer")
+    print()
+
+    # Create persistent socket for receiving data
+    # This ensures we use the same port for both sending config and receiving data
+    print("Setting up receiver socket on port 4991...")
+    recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        recv_sock.bind(('0.0.0.0', DATA_PORT))
+        print("  ✓ Bound to 0.0.0.0:4991")
+    except OSError as e:
+        print(f"  ✗ Failed to bind to port {DATA_PORT}: {e}")
+        print("  Another process may be using this port.")
+        return 1
+    print()
 
     # Test configuration 1: Initial config (2.4 GHz, 30 MSPS, 20 dB)
     config1 = Config(
@@ -317,17 +351,23 @@ def main():
     print(f"  Rate:      {config1.rate_hz/1e6:.1f} MSPS")
     print(f"  Gain:      {config1.gain_db:.1f} dB")
 
-    if not send_config(args.dest, config1):
-        print("✗ Failed to send initial config")
+    # Send config from the same socket we're receiving on
+    try:
+        packet = encode_context_packet(config1)
+        recv_sock.sendto(packet, (args.dest, CONTROL_PORT))
+        print("  ✓ Sent")
+    except Exception as e:
+        print(f"  ✗ Failed to send: {e}")
+        recv_sock.close()
         return 1
-
-    print("  ✓ Sent")
     print()
 
     # Verify initial config
     print("Step 2: Verifying initial configuration...")
-    if not verify_config_applied(args.dest, config1, timeout=10.0):
+    print("  (This will wait for C streamer to start sending data)")
+    if not verify_config_applied(args.dest, config1, timeout=15.0, sock=recv_sock):
         print("✗ Initial configuration verification failed")
+        recv_sock.close()
         return 1
     print()
 
@@ -348,16 +388,21 @@ def main():
     print(f"  Rate:      {config2.rate_hz/1e6:.1f} MSPS  [CHANGED from {config1.rate_hz/1e6:.1f} MSPS]")
     print(f"  Gain:      {config2.gain_db:.1f} dB  [CHANGED from {config1.gain_db:.1f} dB]")
 
-    if not send_config(args.dest, config2):
-        print("✗ Failed to send new config")
+    # Send config from the same socket
+    try:
+        packet = encode_context_packet(config2)
+        recv_sock.sendto(packet, (args.dest, CONTROL_PORT))
+        print("  ✓ Sent")
+    except Exception as e:
+        print(f"  ✗ Failed to send: {e}")
+        recv_sock.close()
         return 1
-
-    print("  ✓ Sent")
     print()
 
     # Verify new config was applied
     print("Step 5: Verifying NEW configuration was applied to hardware...")
-    if not verify_config_applied(args.dest, config2, timeout=10.0):
+    print("  (Should receive context packet within ~100ms)")
+    if not verify_config_applied(args.dest, config2, timeout=10.0, sock=recv_sock):
         print()
         print("="*70)
         print("✗ TEST FAILED")
@@ -365,7 +410,10 @@ def main():
         print("The new configuration was NOT applied to the hardware!")
         print("This indicates the bug is NOT fixed.")
         print()
+        recv_sock.close()
         return 1
+
+    recv_sock.close()
 
     print()
     print("="*70)
