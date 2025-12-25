@@ -166,7 +166,7 @@ Configure Pluto SDR parameters.
 **Request Body**:
 ```json
 {
-  "pluto_uri": "ip:192.168.2.1",
+  "pluto_uri": "ip:pluto.local",
   "center_freq_hz": 2400000000,
   "sample_rate_hz": 30000000,
   "bandwidth_hz": 20000000,

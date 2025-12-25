@@ -4,7 +4,7 @@ import './ControlPanel.css'
 
 export default function ControlPanel({ onConfigChange, onStreamControl, status }) {
   const [config, setConfig] = useState({
-    pluto_uri: 'ip:192.168.2.1',
+    pluto_uri: 'ip:pluto.local',
     center_freq_hz: 2.4e9,
     sample_rate_hz: 30e6,
     bandwidth_hz: 20e6,
@@ -190,7 +190,7 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
               className="text-input"
               value={config.pluto_uri}
               onChange={(e) => handleChange('pluto_uri', e.target.value)}
-              placeholder="ip:192.168.2.1"
+              placeholder="ip:pluto.local"
             />
           </div>
         )}
