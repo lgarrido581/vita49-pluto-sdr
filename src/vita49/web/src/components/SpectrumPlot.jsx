@@ -9,6 +9,8 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
     displayModeBar: false,
     responsive: true
   })
+  const [maxHoldEnabled, setMaxHoldEnabled] = useState(false)
+  const [maxHoldData, setMaxHoldData] = useState(null)
 
   useEffect(() => {
     if (!metadata) return
@@ -46,9 +48,43 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
         color: '#a0a8b8'
       },
       hovermode: 'closest',
-      showlegend: false
+      showlegend: maxHoldEnabled
     })
-  }, [metadata])
+  }, [metadata, maxHoldEnabled])
+
+  // Update max hold data when new spectrum data arrives
+  useEffect(() => {
+    if (!maxHoldEnabled || !spectrumData || !spectrumData.spectrum) {
+      return
+    }
+
+    setMaxHoldData(prevMaxHold => {
+      if (!prevMaxHold || prevMaxHold.length !== spectrumData.spectrum.length) {
+        // Initialize max hold with current spectrum
+        return [...spectrumData.spectrum]
+      }
+
+      // Update max hold by taking maximum of current and previous values
+      return prevMaxHold.map((maxVal, idx) =>
+        Math.max(maxVal, spectrumData.spectrum[idx])
+      )
+    })
+  }, [spectrumData, maxHoldEnabled])
+
+  // Reset max hold data when disabled
+  useEffect(() => {
+    if (!maxHoldEnabled) {
+      setMaxHoldData(null)
+    }
+  }, [maxHoldEnabled])
+
+  const handleMaxHoldToggle = () => {
+    setMaxHoldEnabled(!maxHoldEnabled)
+  }
+
+  const handleMaxHoldReset = () => {
+    setMaxHoldData(null)
+  }
 
   if (!spectrumData || !spectrumData.frequencies || !spectrumData.spectrum || !layout) {
     return (
@@ -69,6 +105,7 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
     y: spectrumData.spectrum,
     type: 'scatter',
     mode: 'lines',
+    name: 'Current',
     line: {
       color: '#10b981',
       width: 1.5
@@ -78,10 +115,45 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
     hovertemplate: '%{x:.2f} MHz<br>%{y:.1f} dBFS<extra></extra>'
   }
 
+  const maxHoldTrace = maxHoldEnabled && maxHoldData ? {
+    x: spectrumData.frequencies,
+    y: maxHoldData,
+    type: 'scatter',
+    mode: 'lines',
+    name: 'Max Hold',
+    line: {
+      color: '#ef4444',
+      width: 1.5,
+      dash: 'dot'
+    },
+    hovertemplate: '%{x:.2f} MHz<br>%{y:.1f} dBFS<extra></extra>'
+  } : null
+
+  const traces = maxHoldTrace ? [trace, maxHoldTrace] : [trace]
+
   return (
     <div className="spectrum-plot card">
       <div className="plot-header">
         <h3><Activity size={18} /> Spectrum Analyzer</h3>
+        <div className="max-hold-controls">
+          <label className="checkbox-label">
+            <input
+              type="checkbox"
+              checked={maxHoldEnabled}
+              onChange={handleMaxHoldToggle}
+            />
+            Max Hold
+          </label>
+          {maxHoldEnabled && (
+            <button
+              className="reset-button"
+              onClick={handleMaxHoldReset}
+              title="Reset max hold"
+            >
+              Reset
+            </button>
+          )}
+        </div>
         <div className="signal-indicators">
           {spectrumData.peak_power_db && (
             <span className="indicator">
@@ -102,7 +174,7 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
       </div>
       <div className="plot-container">
         <Plot
-          data={[trace]}
+          data={traces}
           layout={layout}
           config={config}
           style={{ width: '100%', height: '100%' }}

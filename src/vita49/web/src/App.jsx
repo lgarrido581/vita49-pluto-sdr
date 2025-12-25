@@ -14,10 +14,21 @@ function App() {
   const [waterfallData, setWaterfallData] = useState(null)
   const [metadata, setMetadata] = useState(null)
   const [statistics, setStatistics] = useState(null)
+  const [isPageVisible, setIsPageVisible] = useState(true)
 
   // WebSocket connection
   const wsUrl = `ws://${window.location.hostname}:8001/ws/stream`
   const ws = useWebSocket(wsUrl)
+
+  // Track page visibility to prevent buffering when tab is not active
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      setIsPageVisible(!document.hidden)
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }, [])
 
   // Register WebSocket message handlers
   useEffect(() => {
@@ -31,15 +42,21 @@ function App() {
         setMetadata(data)
       }),
       ws.on('spectrum', (data) => {
-        setSpectrumData(data)
+        // Only update spectrum when page is visible to prevent buffering
+        if (isPageVisible) {
+          setSpectrumData(data)
+        }
       }),
       ws.on('waterfall', (data) => {
-        setWaterfallData(data)
+        // Only update waterfall when page is visible to prevent buffering
+        if (isPageVisible) {
+          setWaterfallData(data)
+        }
       })
     ]
 
     return () => cleanups.forEach(cleanup => cleanup())
-  }, [ws])
+  }, [ws, isPageVisible])
 
   // Fetch status periodically
   useEffect(() => {
