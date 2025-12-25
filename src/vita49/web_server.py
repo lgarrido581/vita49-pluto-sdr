@@ -9,7 +9,7 @@ FastAPI-based web server that provides:
 - Multi-client support
 
 Usage:
-    python -m vita49.web_server --pluto-uri ip:192.168.2.1 --port 8000
+    python -m vita49.web_server --pluto-uri ip:pluto.local --port 8000
 """
 
 import asyncio
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 class PlutoConfig(BaseModel):
     """Pluto SDR configuration"""
-    pluto_uri: str = "ip:192.168.2.1"
+    pluto_uri: str = "ip:pluto.local"
     center_freq_hz: float
     sample_rate_hz: float = 30e6
     bandwidth_hz: float = 20e6
@@ -425,7 +425,7 @@ async def set_config(config: PlutoConfig):
         # Store configuration
         current_config = config
 
-        # Extract Pluto IP from URI (format: "ip:192.168.2.1")
+        # Extract Pluto IP from URI (format: "ip:pluto.local" or "ip:192.168.2.1")
         pluto_ip = config.pluto_uri.replace("ip:", "").replace("usb:", "")
 
         # Send configuration to Pluto via VITA49 Context packet
