@@ -3,7 +3,8 @@ import Plot from 'react-plotly.js'
 import { Activity } from 'lucide-react'
 import './SpectrumPlot.css'
 
-export default function SpectrumPlot({ spectrumData, metadata }) {
+export default function SpectrumPlot({ spectrumData, metadata, perfMonitor }) {
+  const renderStartRef = useRef(null)
   // Initialize layout with default values immediately
   const [layout, setLayout] = useState({
     autosize: true,
@@ -108,6 +109,19 @@ export default function SpectrumPlot({ spectrumData, metadata }) {
       setMaxHoldData(null)
     }
   }, [maxHoldEnabled])
+
+  // Track render performance
+  useEffect(() => {
+    if (perfMonitor && spectrumData) {
+      const start = performance.now()
+
+      // Use setTimeout to measure after React finishes rendering
+      setTimeout(() => {
+        const renderTime = performance.now() - start
+        perfMonitor.measureRender('SpectrumPlot', () => renderTime)
+      }, 0)
+    }
+  }, [spectrumData, perfMonitor])
 
   const handleMaxHoldToggle = () => {
     setMaxHoldEnabled(!maxHoldEnabled)

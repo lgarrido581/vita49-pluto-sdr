@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react'
 import { useWebSocket } from './hooks/useWebSocket'
+import { usePerformanceMonitor } from './hooks/usePerformanceMonitor'
 import ControlPanel from './components/ControlPanel'
 import SpectrumPlot from './components/SpectrumPlot'
 import Waterfall from './components/Waterfall'
 import PacketInspector from './components/PacketInspector'
 import Statistics from './components/Statistics'
+import PerformanceStats from './components/PerformanceStats'
 import { Radio, AlertCircle } from 'lucide-react'
 import './App.css'
 
@@ -19,6 +21,9 @@ function App() {
   // WebSocket connection
   const wsUrl = `ws://${window.location.hostname}:8001/ws/stream`
   const ws = useWebSocket(wsUrl)
+
+  // Performance monitoring
+  const perfMonitor = usePerformanceMonitor(true)
 
   // Track page visibility to prevent buffering when tab is not active
   useEffect(() => {
@@ -41,13 +46,19 @@ function App() {
       ws.on('metadata', (data) => {
         setMetadata(data)
       }),
-      ws.on('spectrum', (data) => {
+      ws.on('spectrum', (data, metadata) => {
+        // Track message for performance monitoring
+        perfMonitor.trackMessage(metadata?.timestamp)
+
         // Only update spectrum when page is visible to prevent buffering
         if (isPageVisible) {
           setSpectrumData(data)
         }
       }),
-      ws.on('waterfall', (data) => {
+      ws.on('waterfall', (data, metadata) => {
+        // Track message for performance monitoring
+        perfMonitor.trackMessage(metadata?.timestamp)
+
         // Only update waterfall when page is visible to prevent buffering
         if (isPageVisible) {
           setWaterfallData(data)
@@ -56,7 +67,7 @@ function App() {
     ]
 
     return () => cleanups.forEach(cleanup => cleanup())
-  }, [ws, isPageVisible])
+  }, [ws, isPageVisible, perfMonitor])
 
   // Fetch status periodically
   useEffect(() => {
@@ -150,16 +161,28 @@ function App() {
         <section className="main-content">
           <div className="plot-grid">
             <div className="plot-item spectrum">
-              <SpectrumPlot spectrumData={spectrumData} metadata={metadata} />
+              <SpectrumPlot spectrumData={spectrumData} metadata={metadata} perfMonitor={perfMonitor} />
             </div>
             <div className="plot-item waterfall">
-              <Waterfall waterfallData={waterfallData} metadata={metadata} />
+              <Waterfall waterfallData={waterfallData} metadata={metadata} perfMonitor={perfMonitor} />
             </div>
           </div>
 
           {/* Statistics */}
           <div className="statistics-section card">
             <Statistics statistics={statistics} metadata={metadata} />
+          </div>
+
+          {/* Performance Monitor */}
+          <div className="performance-section">
+            <PerformanceStats
+              stats={perfMonitor.stats}
+              componentStats={{
+                'Spectrum': perfMonitor.getComponentStats('SpectrumPlot'),
+                'Waterfall': perfMonitor.getComponentStats('Waterfall')
+              }}
+              onReset={perfMonitor.reset}
+            />
           </div>
 
           {/* Packet Inspector */}

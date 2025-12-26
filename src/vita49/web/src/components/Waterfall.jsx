@@ -3,7 +3,7 @@ import Plot from 'react-plotly.js'
 import { Waves } from 'lucide-react'
 import './Waterfall.css'
 
-export default function Waterfall({ waterfallData, metadata }) {
+export default function Waterfall({ waterfallData, metadata, perfMonitor }) {
   // Initialize layout with default values immediately
   const [layout, setLayout] = useState({
     autosize: true,
@@ -38,6 +38,19 @@ export default function Waterfall({ waterfallData, metadata }) {
     displayModeBar: false,
     responsive: true
   })
+
+  // Track render performance
+  useEffect(() => {
+    if (perfMonitor && waterfallData) {
+      const start = performance.now()
+
+      // Use setTimeout to measure after React finishes rendering
+      setTimeout(() => {
+        const renderTime = performance.now() - start
+        perfMonitor.measureRender('Waterfall', () => renderTime)
+      }, 0)
+    }
+  }, [waterfallData, perfMonitor])
 
   // Update layout when metadata becomes available
   useEffect(() => {
