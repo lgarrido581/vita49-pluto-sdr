@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { Play, Pause, Settings, Radio, Gauge, Sliders } from 'lucide-react'
 import './ControlPanel.css'
 
-export default function ControlPanel({ onConfigChange, onStreamControl, status }) {
+export default function ControlPanel({ onConfigChange, onStreamControl, status, websocket }) {
   const [config, setConfig] = useState({
     pluto_uri: 'ip:pluto.local',
     center_freq_hz: 2.4e9,
@@ -14,6 +14,8 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
   const [isStreaming, setIsStreaming] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [configInitialized, setConfigInitialized] = useState(false)
+  const [configStatus, setConfigStatus] = useState(null) // 'sending', 'applying', 'success', 'error', 'timeout'
+  const configTimeoutRef = React.useRef(null)
 
   useEffect(() => {
     if (status) {
@@ -32,17 +34,66 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
     }
   }, [status, configInitialized])
 
+  // Listen for config_applied messages from WebSocket
+  useEffect(() => {
+    if (!websocket) return
+
+    const cleanup = websocket.on('config_applied', (data) => {
+      // Clear the timeout since we got a response
+      if (configTimeoutRef.current) {
+        clearTimeout(configTimeoutRef.current)
+        configTimeoutRef.current = null
+      }
+
+      if (data.success) {
+        setConfigStatus('success')
+        setTimeout(() => setConfigStatus(null), 2000)
+      } else {
+        setConfigStatus('error')
+        console.error('Config application failed:', data.error)
+        setTimeout(() => setConfigStatus(null), 3000)
+      }
+    })
+
+    return cleanup
+  }, [websocket])
+
   const handleChange = (field, value) => {
     setConfig(prev => ({ ...prev, [field]: value }))
   }
 
-  const handleApply = () => {
-    onConfigChange(config)
+  const handleApply = async () => {
+    // Clear any existing timeout
+    if (configTimeoutRef.current) {
+      clearTimeout(configTimeoutRef.current)
+      configTimeoutRef.current = null
+    }
+
+    setConfigStatus('sending')
+    await onConfigChange(config)
+    setConfigStatus('applying')
+
+    // Set 10-second timeout - if no response, reset to allow retry
+    configTimeoutRef.current = setTimeout(() => {
+      console.warn('Config update timeout - no response after 10 seconds')
+      setConfigStatus('timeout')
+      setTimeout(() => setConfigStatus(null), 3000)
+      configTimeoutRef.current = null
+    }, 10000)
   }
 
   const handleStreamToggle = () => {
     onStreamControl(isStreaming ? 'stop' : 'start')
   }
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (configTimeoutRef.current) {
+        clearTimeout(configTimeoutRef.current)
+      }
+    }
+  }, [])
 
   const formatFreq = (hz) => {
     if (hz >= 1e9) return `${(hz / 1e9).toFixed(3)} GHz`
@@ -204,10 +255,16 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status }
           {showAdvanced ? 'Hide' : 'Show'} Advanced
         </button>
         <button
-          className="apply-btn"
+          className={`apply-btn ${configStatus ? 'status-' + configStatus : ''}`}
           onClick={handleApply}
+          disabled={configStatus === 'sending' || configStatus === 'applying'}
         >
-          Apply Configuration
+          {configStatus === 'sending' && '⏳ Sending...'}
+          {configStatus === 'applying' && '⏳ Applying...'}
+          {configStatus === 'success' && '✓ Applied!'}
+          {configStatus === 'error' && '✗ Failed'}
+          {configStatus === 'timeout' && '⏱️ Timeout'}
+          {!configStatus && 'Apply Configuration'}
         </button>
       </div>
 

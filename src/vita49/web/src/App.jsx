@@ -1,10 +1,14 @@
 import React, { useState, useEffect } from 'react'
 import { useWebSocket } from './hooks/useWebSocket'
+import { usePerformanceMonitor } from './hooks/usePerformanceMonitor'
 import ControlPanel from './components/ControlPanel'
 import SpectrumPlot from './components/SpectrumPlot'
+import SpectrumPlotUPlot from './components/SpectrumPlotUPlot'
 import Waterfall from './components/Waterfall'
+import WaterfallCanvas from './components/WaterfallCanvas'
 import PacketInspector from './components/PacketInspector'
 import Statistics from './components/Statistics'
+import PerformanceStats from './components/PerformanceStats'
 import { Radio, AlertCircle } from 'lucide-react'
 import './App.css'
 
@@ -15,10 +19,15 @@ function App() {
   const [metadata, setMetadata] = useState(null)
   const [statistics, setStatistics] = useState(null)
   const [isPageVisible, setIsPageVisible] = useState(true)
+  const [spectrumRenderer, setSpectrumRenderer] = useState('uplot') // 'uplot' or 'plotly'
+  const [waterfallRenderer, setWaterfallRenderer] = useState('canvas') // 'canvas' or 'plotly'
 
-  // WebSocket connection
+  // Performance monitoring (create before WebSocket so it can be passed in)
+  const perfMonitor = usePerformanceMonitor(true)
+
+  // WebSocket connection (pass perfMonitor for latency tracking)
   const wsUrl = `ws://${window.location.hostname}:8001/ws/stream`
-  const ws = useWebSocket(wsUrl)
+  const ws = useWebSocket(wsUrl, perfMonitor)
 
   // Track page visibility to prevent buffering when tab is not active
   useEffect(() => {
@@ -41,13 +50,19 @@ function App() {
       ws.on('metadata', (data) => {
         setMetadata(data)
       }),
-      ws.on('spectrum', (data) => {
+      ws.on('spectrum', (data, metadata) => {
+        // Track message processing time for performance monitoring
+        perfMonitor.trackMessage(metadata?.type, metadata?.sequence)
+
         // Only update spectrum when page is visible to prevent buffering
         if (isPageVisible) {
           setSpectrumData(data)
         }
       }),
-      ws.on('waterfall', (data) => {
+      ws.on('waterfall', (data, metadata) => {
+        // Track message processing time for performance monitoring
+        perfMonitor.trackMessage(metadata?.type, metadata?.sequence)
+
         // Only update waterfall when page is visible to prevent buffering
         if (isPageVisible) {
           setWaterfallData(data)
@@ -56,7 +71,7 @@ function App() {
     ]
 
     return () => cleanups.forEach(cleanup => cleanup())
-  }, [ws, isPageVisible])
+  }, [ws, isPageVisible, perfMonitor])
 
   // Fetch status periodically
   useEffect(() => {
@@ -142,23 +157,92 @@ function App() {
             onConfigChange={handleConfigChange}
             onStreamControl={handleStreamControl}
             status={status}
+            websocket={ws}
           />
         </aside>
 
         {/* Center - Plots */}
         <section className="main-content">
+          {/* Renderer Controls */}
+          <div className="renderer-controls" style={{
+            display: 'flex',
+            gap: '1rem',
+            marginBottom: '1rem',
+            padding: '0.5rem',
+            background: '#131820',
+            borderRadius: '8px',
+            border: '1px solid #2a3142'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <label style={{ color: '#a0a8b8', fontSize: '0.9rem' }}>Spectrum:</label>
+              <select
+                value={spectrumRenderer}
+                onChange={(e) => setSpectrumRenderer(e.target.value)}
+                style={{
+                  background: '#1a1f2e',
+                  color: '#e8eaf0',
+                  border: '1px solid #2a3142',
+                  borderRadius: '4px',
+                  padding: '0.25rem 0.5rem',
+                  fontSize: '0.9rem'
+                }}
+              >
+                <option value="uplot">uPlot (Fast)</option>
+                <option value="plotly">Plotly (Stable)</option>
+              </select>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <label style={{ color: '#a0a8b8', fontSize: '0.9rem' }}>Waterfall:</label>
+              <select
+                value={waterfallRenderer}
+                onChange={(e) => setWaterfallRenderer(e.target.value)}
+                style={{
+                  background: '#1a1f2e',
+                  color: '#e8eaf0',
+                  border: '1px solid #2a3142',
+                  borderRadius: '4px',
+                  padding: '0.25rem 0.5rem',
+                  fontSize: '0.9rem'
+                }}
+              >
+                <option value="canvas">Canvas (Fast)</option>
+                <option value="plotly">Plotly (Stable)</option>
+              </select>
+            </div>
+          </div>
+
           <div className="plot-grid">
             <div className="plot-item spectrum">
-              <SpectrumPlot spectrumData={spectrumData} metadata={metadata} />
+              {spectrumRenderer === 'uplot' ? (
+                <SpectrumPlotUPlot spectrumData={spectrumData} metadata={metadata} perfMonitor={perfMonitor} />
+              ) : (
+                <SpectrumPlot spectrumData={spectrumData} metadata={metadata} perfMonitor={perfMonitor} />
+              )}
             </div>
             <div className="plot-item waterfall">
-              <Waterfall waterfallData={waterfallData} metadata={metadata} />
+              {waterfallRenderer === 'canvas' ? (
+                <WaterfallCanvas waterfallData={waterfallData} metadata={metadata} perfMonitor={perfMonitor} />
+              ) : (
+                <Waterfall waterfallData={waterfallData} metadata={metadata} perfMonitor={perfMonitor} />
+              )}
             </div>
           </div>
 
           {/* Statistics */}
           <div className="statistics-section card">
             <Statistics statistics={statistics} metadata={metadata} />
+          </div>
+
+          {/* Performance Monitor */}
+          <div className="performance-section">
+            <PerformanceStats
+              stats={perfMonitor.stats}
+              componentStats={{
+                'Spectrum': perfMonitor.getComponentStats('SpectrumPlot'),
+                'Waterfall': perfMonitor.getComponentStats('Waterfall')
+              }}
+              onReset={perfMonitor.reset}
+            />
           </div>
 
           {/* Packet Inspector */}
