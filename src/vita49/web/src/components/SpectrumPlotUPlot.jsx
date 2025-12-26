@@ -47,9 +47,23 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
     }
   }, [maxHoldEnabled])
 
-  // Initialize uPlot chart (only once on mount)
+  // Initialize uPlot chart when DOM ref is ready and we have initial data
   useEffect(() => {
-    if (!chartRef.current || plotInstanceRef.current) return
+    // Skip if already initialized
+    if (plotInstanceRef.current) {
+      return
+    }
+
+    // Need both DOM ref and data to initialize
+    if (!chartRef.current) {
+      console.log('uPlot: Waiting for DOM ref')
+      return
+    }
+
+    if (!spectrumData || !spectrumData.frequencies || spectrumData.frequencies.length === 0) {
+      console.log('uPlot: Waiting for spectrum data')
+      return
+    }
 
     const sampleRate = metadata?.sample_rate_hz || 30e6
 
@@ -102,10 +116,15 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
       ]
     }
 
+    console.log('✓ Initializing uPlot with', spectrumData.frequencies.length, 'points')
     plotInstanceRef.current = new uPlot(opts, [[0], [0], [0]], chartRef.current)
     setPlotReady(true)  // Signal that plot is ready for data updates
+  }, [spectrumData, metadata]) // Retry when data or metadata arrives
 
-    // Handle window resize
+  // Setup resize handler and cleanup (separate effect to avoid recreation)
+  useEffect(() => {
+    if (!plotInstanceRef.current || !chartRef.current) return
+
     const handleResize = () => {
       if (plotInstanceRef.current && chartRef.current) {
         plotInstanceRef.current.setSize({
@@ -119,13 +138,20 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
 
     return () => {
       window.removeEventListener('resize', handleResize)
+    }
+  }, [plotReady]) // Run when plot becomes ready
+
+  // Cleanup on unmount only
+  useEffect(() => {
+    return () => {
       if (plotInstanceRef.current) {
+        console.log('uPlot: Cleaning up')
         plotInstanceRef.current.destroy()
         plotInstanceRef.current = null
+        setPlotReady(false)
       }
-      setPlotReady(false)
     }
-  }, []) // Only on mount!
+  }, [])
 
   // Update axes range when metadata changes (without destroying plot)
   useEffect(() => {
