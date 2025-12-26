@@ -44,6 +44,11 @@
 #define CONTEXT_INTERVAL        100             /* Send context every N packets */
 #define MAX_SUBSCRIBERS         16              /* Max simultaneous receivers */
 
+/* Subscriber Management Configuration */
+#define SUBSCRIBER_TIMEOUT_US       30000000    /* 30 seconds */
+#define MAX_CONSECUTIVE_FAILURES    10          /* Remove after 10 failures */
+#define SUBSCRIBER_CLEANUP_INTERVAL 100         /* Check every 100 packets */
+
 /* MTU and Packet Size Configuration */
 #define MTU_STANDARD            1500            /* Standard Ethernet */
 #define MTU_JUMBO               9000            /* Jumbo frames */
@@ -71,6 +76,16 @@ static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime base
 typedef struct {
     struct sockaddr_in addr;
     bool active;
+
+    /* Health tracking */
+    int consecutive_failures;
+    uint64_t packets_sent;
+    uint64_t bytes_sent;
+    uint64_t last_seen_us;       /* Last successful send timestamp */
+    uint64_t first_seen_us;      /* When subscriber was added */
+
+    /* Statistics */
+    uint64_t total_failures;
 } subscriber_t;
 
 static subscriber_t g_subscribers[MAX_SUBSCRIBERS];
@@ -145,6 +160,8 @@ typedef struct {
 /* Function prototypes */
 static void signal_handler(int sig);
 static void add_subscriber(struct sockaddr_in *addr);
+static int send_to_subscriber(int sock, uint8_t *buf, size_t len, subscriber_t *sub);
+static void cleanup_dead_subscribers(void);
 static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len);
 static uint64_t get_timestamp_us(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
@@ -201,39 +218,152 @@ static void add_subscriber(struct sockaddr_in *addr) {
 
     /* Check if already exists */
     for (int i = 0; i < g_subscriber_count; i++) {
-        if (g_subscribers[i].active &&
-            g_subscribers[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr &&
+        if (g_subscribers[i].addr.sin_addr.s_addr == addr->sin_addr.s_addr &&
             g_subscribers[i].addr.sin_port == addr->sin_port) {
+
+            /* Reactivate if was inactive */
+            if (!g_subscribers[i].active) {
+                g_subscribers[i].active = true;
+                g_subscribers[i].consecutive_failures = 0;
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr->sin_addr, ip_str, INET_ADDRSTRLEN);
+                printf("[Control] Reactivated subscriber: %s:%d\n",
+                       ip_str, ntohs(addr->sin_port));
+            }
+
             pthread_mutex_unlock(&g_subscribers_mutex);
-            return;  /* Already subscribed */
+            return;
         }
     }
 
     /* Add new subscriber */
     if (g_subscriber_count < MAX_SUBSCRIBERS) {
-        g_subscribers[g_subscriber_count].addr = *addr;
-        g_subscribers[g_subscriber_count].active = true;
+        subscriber_t *sub = &g_subscribers[g_subscriber_count];
+        sub->addr = *addr;
+        sub->active = true;
+        sub->consecutive_failures = 0;
+        sub->packets_sent = 0;
+        sub->bytes_sent = 0;
+        sub->last_seen_us = get_timestamp_us();
+        sub->first_seen_us = sub->last_seen_us;
+        sub->total_failures = 0;
+
         g_subscriber_count++;
 
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &addr->sin_addr, ip_str, INET_ADDRSTRLEN);
         printf("[Control] Added subscriber: %s:%d (total: %d)\n",
                ip_str, ntohs(addr->sin_port), g_subscriber_count);
+    } else {
+        fprintf(stderr, "[Control] ERROR: Maximum subscribers reached (%d)\n",
+                MAX_SUBSCRIBERS);
     }
 
     pthread_mutex_unlock(&g_subscribers_mutex);
 }
 
+/* Send packet to individual subscriber with error handling */
+static int send_to_subscriber(int sock, uint8_t *buf, size_t len, subscriber_t *sub) {
+    ssize_t sent = sendto(sock, buf, len, 0,
+                         (struct sockaddr *)&sub->addr,
+                         sizeof(sub->addr));
+
+    if (sent < 0) {
+        sub->consecutive_failures++;
+        sub->total_failures++;
+
+        pthread_mutex_lock(&g_stats.mutex);
+        g_stats.send_failures++;
+        pthread_mutex_unlock(&g_stats.mutex);
+
+        /* Log periodic failures (every 10) */
+        if (sub->consecutive_failures % 10 == 0) {
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sub->addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+            fprintf(stderr, "[Streaming] WARNING: Send to %s:%d failed %d times (total: %llu)\n",
+                   ip_str, ntohs(sub->addr.sin_port), sub->consecutive_failures,
+                   (unsigned long long)sub->total_failures);
+        }
+
+        /* Mark inactive after threshold */
+        if (sub->consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sub->addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+            fprintf(stderr, "[Streaming] Marking subscriber %s:%d as inactive after %d failures\n",
+                   ip_str, ntohs(sub->addr.sin_port), sub->consecutive_failures);
+            sub->active = false;
+        }
+
+        return -1;
+    }
+
+    /* Success - reset failure counter and update stats */
+    sub->consecutive_failures = 0;
+    sub->last_seen_us = get_timestamp_us();
+    sub->packets_sent++;
+    sub->bytes_sent += len;
+
+    return 0;
+}
+
+/* Remove dead subscribers from list */
+static void cleanup_dead_subscribers(void) {
+    uint64_t current_time = get_timestamp_us();
+    int removed = 0;
+
+    pthread_mutex_lock(&g_subscribers_mutex);
+
+    /* Compact array, removing inactive subscribers */
+    int write_idx = 0;
+    for (int read_idx = 0; read_idx < g_subscriber_count; read_idx++) {
+        subscriber_t *sub = &g_subscribers[read_idx];
+
+        /* Check if subscriber should be removed */
+        bool should_remove = false;
+
+        if (!sub->active) {
+            should_remove = true;
+        } else if (sub->last_seen_us > 0 &&
+                  (current_time - sub->last_seen_us) > SUBSCRIBER_TIMEOUT_US) {
+            /* Timeout - no successful sends in 30 seconds */
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sub->addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+            fprintf(stderr, "[Streaming] Removing subscriber %s:%d (timeout)\n",
+                   ip_str, ntohs(sub->addr.sin_port));
+            should_remove = true;
+        }
+
+        if (!should_remove) {
+            /* Keep this subscriber */
+            if (write_idx != read_idx) {
+                g_subscribers[write_idx] = g_subscribers[read_idx];
+            }
+            write_idx++;
+        } else {
+            removed++;
+        }
+    }
+
+    g_subscriber_count = write_idx;
+
+    pthread_mutex_unlock(&g_subscribers_mutex);
+
+    if (removed > 0) {
+        printf("[Streaming] Removed %d dead subscriber(s), %d active remain\n",
+               removed, g_subscriber_count);
+    }
+}
+
 /* Broadcast packet to all active subscribers */
 static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len) {
     pthread_mutex_lock(&g_subscribers_mutex);
+
     for (int i = 0; i < g_subscriber_count; i++) {
         if (g_subscribers[i].active) {
-            sendto(sock, buf, len, 0,
-                  (struct sockaddr *)&g_subscribers[i].addr,
-                  sizeof(g_subscribers[i].addr));
+            send_to_subscriber(sock, buf, len, &g_subscribers[i]);
         }
     }
+
     pthread_mutex_unlock(&g_subscribers_mutex);
 }
 
@@ -595,11 +725,17 @@ static void *streaming_thread(void *arg) {
 
     uint8_t packet_count = 0;
     int packets_since_context = 0;
+    uint64_t packets_sent = 0;
     static uint8_t packet_buf[MAX_PACKET_BUFFER];  /* Static to avoid stack overflow with large buffer */
     size_t packet_len;
     uint64_t last_config_check_us = get_timestamp_us();
 
     while (g_running) {
+        /* Periodic cleanup of dead subscribers */
+        if (packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0 && packets_sent > 0) {
+            cleanup_dead_subscribers();
+        }
+
         /* Check for configuration changes every 100ms */
         uint64_t now_us = get_timestamp_us();
         if (now_us - last_config_check_us >= 100000) {  /* 100ms = 100,000 microseconds */
@@ -742,6 +878,7 @@ static void *streaming_thread(void *arg) {
             g_stats.bytes_sent += packet_len;
             pthread_mutex_unlock(&g_stats.mutex);
             packets_since_context++;
+            packets_sent++;
         }
 
         /* Loop timing measurements */
@@ -948,6 +1085,29 @@ int main(int argc, char **argv) {
                avg_loop,
                (unsigned long long)min_loop,
                (unsigned long long)max_loop);
+
+        /* Detailed subscriber statistics */
+        printf("\n[Subscribers] Active: %d/%d\n", g_subscriber_count, MAX_SUBSCRIBERS);
+        pthread_mutex_lock(&g_subscribers_mutex);
+        for (int i = 0; i < g_subscriber_count; i++) {
+            if (g_subscribers[i].active) {
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &g_subscribers[i].addr.sin_addr,
+                         ip_str, INET_ADDRSTRLEN);
+
+                uint64_t current_time = get_timestamp_us();
+                uint64_t uptime = (current_time - g_subscribers[i].first_seen_us) / 1000000;
+
+                printf("  [%d] %s:%d - Pkts: %llu, Fails: %d/%llu, Uptime: %llus\n",
+                       i, ip_str, ntohs(g_subscribers[i].addr.sin_port),
+                       (unsigned long long)g_subscribers[i].packets_sent,
+                       g_subscribers[i].consecutive_failures,
+                       (unsigned long long)g_subscribers[i].total_failures,
+                       (unsigned long long)uptime);
+            }
+        }
+        pthread_mutex_unlock(&g_subscribers_mutex);
+        printf("\n");
     }
 
     /* Cleanup */
