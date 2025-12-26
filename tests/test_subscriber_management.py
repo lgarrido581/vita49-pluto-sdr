@@ -182,7 +182,7 @@ def test_1_subscriber_addition():
     print("TEST 1: Subscriber Addition and Limit Enforcement")
     print("="*70)
 
-    streamer_ip = "127.0.0.1"
+    streamer_ip = "pluto.local"
     receivers = []
 
     try:
@@ -228,7 +228,7 @@ def test_2_failure_handling():
     print("TEST 2: Failure Handling and Auto-Removal")
     print("="*70)
 
-    streamer_ip = "127.0.0.1"
+    streamer_ip = "pluto.local"
     receiver = UDPReceiver()
 
     try:
@@ -283,7 +283,7 @@ def test_3_timeout_mechanism():
     print("TEST 3: Subscriber Timeout Mechanism")
     print("="*70)
 
-    streamer_ip = "127.0.0.1"
+    streamer_ip = "pluto.local"
     receiver = UDPReceiver()
 
     try:
@@ -358,7 +358,7 @@ def test_4_reactivation():
     print("TEST 4: Subscriber Reactivation")
     print("="*70)
 
-    streamer_ip = "127.0.0.1"
+    streamer_ip = "pluto.local"
     receiver = UDPReceiver()
 
     try:
@@ -410,7 +410,7 @@ def test_5_stress_test():
     print("\nNOTE: This test uses SO_REUSEPORT to share port 4991 among receivers")
     print("      All receivers on same machine will share incoming packets")
 
-    streamer_ip = "127.0.0.1"
+    streamer_ip = "pluto.local"
     receivers = []
 
     try:
@@ -508,7 +508,7 @@ def main():
     print("VITA49 SUBSCRIBER MANAGEMENT TEST SUITE")
     print("="*70)
     print("\nNOTE: These tests require the vita49_streamer to be running")
-    print("      Update streamer_ip in tests if not using 127.0.0.1")
+    print("      Update streamer_ip in tests if not using pluto.local")
     print("\nPre-requisites:")
     print("  1. Compile: make")
     print("  2. Run: ./build/vita49_streamer")
