@@ -46,23 +46,21 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
     }
   }, [maxHoldEnabled])
 
-  // Initialize uPlot chart
+  // Initialize uPlot chart (only once on mount)
   useEffect(() => {
-    if (!chartRef.current) return
+    if (!chartRef.current || plotInstanceRef.current) return
 
     const sampleRate = metadata?.sample_rate_hz || 30e6
-    const centerFreq = metadata?.center_freq_hz || 2.4e9
 
     const opts = {
       width: chartRef.current.clientWidth,
       height: 400,
-      title: `Spectrum - ${(centerFreq / 1e9).toFixed(3)} GHz`,
       padding: [10, 10, 0, 0],
       cursor: {
         drag: { x: false, y: false }
       },
       legend: {
-        show: maxHoldEnabled
+        show: false
       },
       scales: {
         x: {
@@ -92,21 +90,18 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
           stroke: '#10b981',
           width: 2,
           fill: 'rgba(16, 185, 129, 0.1)'
+        },
+        {
+          label: 'Max Hold',
+          stroke: '#ef4444',
+          width: 2,
+          dash: [5, 5],
+          show: false  // Hidden by default
         }
       ]
     }
 
-    // Add max hold series if enabled
-    if (maxHoldEnabled) {
-      opts.series.push({
-        label: 'Max Hold',
-        stroke: '#ef4444',
-        width: 2,
-        dash: [5, 5]
-      })
-    }
-
-    plotInstanceRef.current = new uPlot(opts, [], chartRef.current)
+    plotInstanceRef.current = new uPlot(opts, [[0], [0], [0]], chartRef.current)
 
     // Handle window resize
     const handleResize = () => {
@@ -127,7 +122,26 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
         plotInstanceRef.current = null
       }
     }
-  }, [metadata, maxHoldEnabled])
+  }, []) // Only on mount!
+
+  // Update axes range when metadata changes (without destroying plot)
+  useEffect(() => {
+    if (!plotInstanceRef.current || !metadata) return
+
+    const sampleRate = metadata.sample_rate_hz || 30e6
+
+    plotInstanceRef.current.scales.x.range = (u, min, max) => {
+      return [-sampleRate / 2 / 1e6, sampleRate / 2 / 1e6]
+    }
+  }, [metadata])
+
+  // Toggle max hold series visibility
+  useEffect(() => {
+    if (!plotInstanceRef.current) return
+
+    // Show/hide the max hold series (index 2)
+    plotInstanceRef.current.setSeries(2, { show: maxHoldEnabled })
+  }, [maxHoldEnabled])
 
   // Update chart data when spectrum data changes
   useEffect(() => {
@@ -148,20 +162,16 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
     }
 
     try {
-      const data = maxHoldEnabled && maxHoldData && maxHoldData.length > 0
-        ? [spectrumData.frequencies, spectrumData.spectrum, maxHoldData]
-        : [spectrumData.frequencies, spectrumData.spectrum]
+      // Always pass 3 series (x, current, maxhold) - visibility controlled by setSeries
+      const maxHold = (maxHoldData && maxHoldData.length > 0) ? maxHoldData : spectrumData.spectrum
+      const data = [spectrumData.frequencies, spectrumData.spectrum, maxHold]
 
-      // Use requestAnimationFrame to ensure DOM is ready and avoid race conditions
-      requestAnimationFrame(() => {
-        if (plotInstanceRef.current) {
-          plotInstanceRef.current.setData(data)
-        }
-      })
+      // Update data without RAF to avoid timing issues
+      plotInstanceRef.current.setData(data)
     } catch (err) {
       console.error('Error updating uPlot:', err)
     }
-  }, [spectrumData, maxHoldData, maxHoldEnabled])
+  }, [spectrumData, maxHoldData])
 
   const handleMaxHoldToggle = () => {
     setMaxHoldEnabled(!maxHoldEnabled)
