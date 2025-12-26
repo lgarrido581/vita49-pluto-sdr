@@ -25,6 +25,7 @@ export function usePerformanceMonitor(enabled = true) {
   const lastStatsUpdateRef = useRef(performance.now())
   const messageLatenciesRef = useRef([])
   const renderTimesRef = useRef([])
+  const messageReceiveTimesRef = useRef({})
 
   // FPS monitoring
   useEffect(() => {
@@ -125,15 +126,35 @@ export function usePerformanceMonitor(enabled = true) {
   }
 
   // Track message processing
-  const trackMessage = (messageTimestamp) => {
+  const trackMessage = (messageType, sequence) => {
     if (!enabled) return
 
     messageCountRef.current++
 
-    if (messageTimestamp) {
-      const latency = Date.now() - messageTimestamp * 1000
-      messageLatenciesRef.current.push(latency)
+    // Track message receive time (when it arrives at WebSocket)
+    if (messageType && sequence !== undefined) {
+      const key = `${messageType}_${sequence}`
+
+      // If we have a receive time for this message, calculate processing delay
+      if (messageReceiveTimesRef.current[key]) {
+        const processingDelay = performance.now() - messageReceiveTimesRef.current[key]
+        messageLatenciesRef.current.push(processingDelay)
+
+        // Clean up old entries (keep only last 100)
+        const keys = Object.keys(messageReceiveTimesRef.current)
+        if (keys.length > 100) {
+          delete messageReceiveTimesRef.current[keys[0]]
+        }
+      }
     }
+  }
+
+  // Track when message is received by WebSocket (before processing)
+  const trackMessageReceived = (messageType, sequence) => {
+    if (!enabled || !messageType || sequence === undefined) return
+
+    const key = `${messageType}_${sequence}`
+    messageReceiveTimesRef.current[key] = performance.now()
   }
 
   // Get detailed render stats for specific component
@@ -176,6 +197,7 @@ export function usePerformanceMonitor(enabled = true) {
     stats,
     measureRender,
     trackMessage,
+    trackMessageReceived,
     getComponentStats,
     reset
   }

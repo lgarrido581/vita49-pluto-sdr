@@ -18,12 +18,12 @@ function App() {
   const [statistics, setStatistics] = useState(null)
   const [isPageVisible, setIsPageVisible] = useState(true)
 
-  // WebSocket connection
-  const wsUrl = `ws://${window.location.hostname}:8001/ws/stream`
-  const ws = useWebSocket(wsUrl)
-
-  // Performance monitoring
+  // Performance monitoring (create before WebSocket so it can be passed in)
   const perfMonitor = usePerformanceMonitor(true)
+
+  // WebSocket connection (pass perfMonitor for latency tracking)
+  const wsUrl = `ws://${window.location.hostname}:8001/ws/stream`
+  const ws = useWebSocket(wsUrl, perfMonitor)
 
   // Track page visibility to prevent buffering when tab is not active
   useEffect(() => {
@@ -47,8 +47,8 @@ function App() {
         setMetadata(data)
       }),
       ws.on('spectrum', (data, metadata) => {
-        // Track message for performance monitoring
-        perfMonitor.trackMessage(metadata?.timestamp)
+        // Track message processing time for performance monitoring
+        perfMonitor.trackMessage(metadata?.type, metadata?.sequence)
 
         // Only update spectrum when page is visible to prevent buffering
         if (isPageVisible) {
@@ -56,8 +56,8 @@ function App() {
         }
       }),
       ws.on('waterfall', (data, metadata) => {
-        // Track message for performance monitoring
-        perfMonitor.trackMessage(metadata?.timestamp)
+        // Track message processing time for performance monitoring
+        perfMonitor.trackMessage(metadata?.type, metadata?.sequence)
 
         // Only update waterfall when page is visible to prevent buffering
         if (isPageVisible) {

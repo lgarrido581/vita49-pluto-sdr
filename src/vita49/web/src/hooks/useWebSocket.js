@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
  * Custom hook for WebSocket connection to VITA49 stream
  * Implements frame dropping and sequence number tracking for optimal performance
  */
-export function useWebSocket(url) {
+export function useWebSocket(url, perfMonitor = null) {
   const [isConnected, setIsConnected] = useState(false)
   const [lastMessage, setLastMessage] = useState(null)
   const [error, setError] = useState(null)
@@ -18,6 +18,12 @@ export function useWebSocket(url) {
   // Latest message queue for high-frequency types (spectrum, waterfall)
   const latestMessagesRef = useRef({})
   const processingFrameRef = useRef(false)
+
+  // Store perfMonitor ref to avoid stale closures
+  const perfMonitorRef = useRef(perfMonitor)
+  useEffect(() => {
+    perfMonitorRef.current = perfMonitor
+  }, [perfMonitor])
 
   // Register message handler for specific message types
   const on = useCallback((type, handler) => {
@@ -73,6 +79,11 @@ export function useWebSocket(url) {
           const message = JSON.parse(event.data)
           const { type, sequence, timestamp, data } = message
 
+          // Track message receive time for performance monitoring
+          if (perfMonitorRef.current?.trackMessageReceived) {
+            perfMonitorRef.current.trackMessageReceived(type, sequence)
+          }
+
           // Check sequence number to drop out-of-order messages
           if (sequence !== undefined) {
             const lastSeq = lastSequenceRef.current[type] || 0
@@ -88,7 +99,7 @@ export function useWebSocket(url) {
           // For high-frequency message types (spectrum, waterfall), queue the latest
           // and process in animation frame to prevent backlog
           if (type === 'spectrum' || type === 'waterfall') {
-            latestMessagesRef.current[type] = { data, metadata: { sequence, timestamp } }
+            latestMessagesRef.current[type] = { data, metadata: { sequence, timestamp, type } }
           } else {
             // For low-frequency messages (status, metadata, config_applied), process immediately
             const handlers = handlersRef.current[type] || []

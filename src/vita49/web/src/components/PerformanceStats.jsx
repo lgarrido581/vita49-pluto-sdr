@@ -72,14 +72,14 @@ export default function PerformanceStats({ stats, componentStats, onReset }) {
           </div>
         </div>
 
-        {/* Message Latency */}
+        {/* Processing Delay */}
         <div className="perf-item">
-          <div className="perf-label">WebSocket Latency</div>
+          <div className="perf-label">Processing Delay</div>
           <div className="perf-value" style={{ color: getLatencyColor(stats.avgMessageLatency) }}>
             {stats.avgMessageLatency} ms
           </div>
           <div className="perf-detail">
-            Avg last second
+            WebSocket → Handler
           </div>
         </div>
 
