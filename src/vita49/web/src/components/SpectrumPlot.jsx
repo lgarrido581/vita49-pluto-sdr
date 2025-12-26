@@ -148,7 +148,7 @@ export default function SpectrumPlot({ spectrumData, metadata, perfMonitor }) {
   const trace = {
     x: spectrumData.frequencies,
     y: spectrumData.spectrum,
-    type: 'scatter',
+    type: 'scattergl',  // WebGL accelerated
     mode: 'lines',
     name: 'Current',
     line: {
@@ -163,7 +163,7 @@ export default function SpectrumPlot({ spectrumData, metadata, perfMonitor }) {
   const maxHoldTrace = maxHoldEnabled && maxHoldData ? {
     x: spectrumData.frequencies,
     y: maxHoldData,
-    type: 'scatter',
+    type: 'scattergl',  // WebGL accelerated
     mode: 'lines',
     name: 'Max Hold',
     line: {

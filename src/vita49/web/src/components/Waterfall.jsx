@@ -111,7 +111,7 @@ export default function Waterfall({ waterfallData, metadata, perfMonitor }) {
   const trace = {
     z: waterfallData.waterfall,
     x: freqBins,
-    type: 'heatmap',
+    type: 'heatmapgl',  // WebGL accelerated
     colorscale: [
       [0, '#0a0e17'],
       [0.2, '#1e3a8a'],
