@@ -39,11 +39,22 @@
 #define DEFAULT_RATE_HZ         30000000        /* 30 MSPS */
 #define DEFAULT_GAIN_DB         20.0
 #define DEFAULT_BUFFER_SIZE     16384           /* Samples per buffer */
-#define SAMPLES_PER_PACKET      360             /* IQ samples per VITA49 packet */
 #define CONTROL_PORT            4990            /* Config reception port */
 #define DATA_PORT               4991            /* Data streaming port */
 #define CONTEXT_INTERVAL        100             /* Send context every N packets */
 #define MAX_SUBSCRIBERS         16              /* Max simultaneous receivers */
+
+/* MTU and Packet Size Configuration */
+#define MTU_STANDARD            1500            /* Standard Ethernet */
+#define MTU_JUMBO               9000            /* Jumbo frames */
+#define IP_HEADER_SIZE          20              /* IPv4 header */
+#define UDP_HEADER_SIZE         8               /* UDP header */
+#define VITA49_HEADER_SIZE      20              /* VRT header + stream ID + timestamp */
+#define VITA49_TRAILER_SIZE     4               /* VRT trailer */
+
+#define VITA49_OVERHEAD         (VITA49_HEADER_SIZE + VITA49_TRAILER_SIZE)
+#define IP_UDP_OVERHEAD         (IP_HEADER_SIZE + UDP_HEADER_SIZE)
+#define MAX_PACKET_BUFFER       16384           /* Support jumbo frames */
 
 /* VITA49 Packet Types */
 #define VRT_PKT_TYPE_DATA       0x1             /* IF Data with Stream ID */
@@ -54,6 +65,7 @@
 /* Global state */
 static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime based on MTU */
 
 /* Subscriber list */
 typedef struct {
@@ -135,6 +147,7 @@ static void signal_handler(int sig);
 static void add_subscriber(struct sockaddr_in *addr);
 static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len);
 static uint64_t get_timestamp_us(void);
+static size_t calculate_optimal_samples_per_packet(size_t mtu);
 static void encode_context_packet(uint8_t *buf, size_t *len);
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count);
 static void *control_thread(void *arg);
@@ -155,6 +168,24 @@ static uint64_t get_timestamp_us(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+}
+
+/* Calculate optimal samples per packet to fit within MTU */
+static size_t calculate_optimal_samples_per_packet(size_t mtu) {
+    /* Available payload after all headers */
+    size_t available_bytes = mtu - IP_UDP_OVERHEAD - VITA49_OVERHEAD;
+
+    /* Each sample is 2 * int16_t (I + Q) */
+    size_t sample_bytes = 2 * sizeof(int16_t);
+
+    /* Calculate max samples that fit */
+    size_t max_samples = available_bytes / sample_bytes;
+
+    /* Align to ensure 32-bit boundary (VITA49 requirement) */
+    /* Round down to nearest even number */
+    size_t aligned_samples = (max_samples / 2) * 2;
+
+    return aligned_samples;
 }
 
 /* Signal handler for graceful shutdown */
@@ -324,6 +355,18 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
 /* Encode VITA49 Data packet */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count) {
+    /* Validate buffer won't overflow */
+    size_t required_size = sizeof(vrt_data_header_t) +
+                          (num_samples * 2 * sizeof(int16_t)) +
+                          sizeof(uint32_t);  /* trailer */
+
+    if (required_size > MAX_PACKET_BUFFER) {
+        fprintf(stderr, "ERROR: Packet would exceed buffer size (%zu > %d)\n",
+                required_size, MAX_PACKET_BUFFER);
+        *len = 0;
+        return;
+    }
+
     vrt_data_header_t *hdr = (vrt_data_header_t *)buf;
     int16_t *payload = (int16_t *)(buf + sizeof(vrt_data_header_t));
 
@@ -552,7 +595,7 @@ static void *streaming_thread(void *arg) {
 
     uint8_t packet_count = 0;
     int packets_since_context = 0;
-    uint8_t packet_buf[8192];
+    static uint8_t packet_buf[MAX_PACKET_BUFFER];  /* Static to avoid stack overflow with large buffer */
     size_t packet_len;
     uint64_t last_config_check_us = get_timestamp_us();
 
@@ -685,9 +728,9 @@ static void *streaming_thread(void *arg) {
         }
 
         /* Packetize and send */
-        for (size_t offset = 0; offset < num_samples; offset += SAMPLES_PER_PACKET) {
-            size_t chunk_size = (offset + SAMPLES_PER_PACKET > num_samples) ?
-                               (num_samples - offset) : SAMPLES_PER_PACKET;
+        for (size_t offset = 0; offset < num_samples; offset += g_samples_per_packet) {
+            size_t chunk_size = (offset + g_samples_per_packet > num_samples) ?
+                               (num_samples - offset) : g_samples_per_packet;
 
             encode_data_packet(packet_buf, &packet_len, samples + offset * 2,
                              chunk_size, &packet_count);
@@ -774,10 +817,54 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
 }
 
 /* Main */
-int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) {
+int main(int argc, char **argv) {
+    /* Parse command-line arguments for MTU */
+    size_t mtu = MTU_STANDARD;  /* Default to standard Ethernet */
+    bool use_jumbo = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--jumbo") == 0) {
+            use_jumbo = true;
+            mtu = MTU_JUMBO;
+        } else if (strcmp(argv[i], "--mtu") == 0 && i + 1 < argc) {
+            mtu = (size_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [options]\n", argv[0]);
+            printf("Options:\n");
+            printf("  --jumbo           Use jumbo frames (MTU 9000)\n");
+            printf("  --mtu <size>      Set custom MTU size in bytes\n");
+            printf("  --help, -h        Show this help message\n");
+            printf("\nExamples:\n");
+            printf("  %s                # Standard MTU (1500 bytes)\n", argv[0]);
+            printf("  %s --jumbo        # Jumbo frames (9000 bytes)\n", argv[0]);
+            printf("  %s --mtu 1492     # PPPoE MTU\n", argv[0]);
+            return 0;
+        }
+    }
+
+    /* Calculate optimal packet size based on MTU */
+    g_samples_per_packet = calculate_optimal_samples_per_packet(mtu);
+
+    /* Calculate actual packet sizes for verification */
+    size_t packet_payload = g_samples_per_packet * 2 * sizeof(int16_t);
+    size_t total_vita49_packet = packet_payload + VITA49_OVERHEAD;
+    size_t total_udp_datagram = total_vita49_packet + IP_UDP_OVERHEAD;
+
     printf("========================================\n");
     printf("VITA49 Standalone Streamer for Pluto\n");
-    printf("========================================\n\n");
+    printf("========================================\n");
+    printf("MTU: %zu bytes%s\n", mtu, use_jumbo ? " (Jumbo frames)" : "");
+    printf("Samples per packet: %zu\n", g_samples_per_packet);
+    printf("VITA49 packet size: %zu bytes\n", total_vita49_packet);
+    printf("UDP datagram size: %zu bytes\n", total_udp_datagram);
+
+    if (total_udp_datagram > mtu) {
+        fprintf(stderr, "WARNING: Packet size exceeds MTU! Will fragment.\n");
+    } else {
+        double efficiency = 100.0 * total_udp_datagram / mtu;
+        printf("✓ Packet fits in MTU (efficiency: %.1f%%)\n", efficiency);
+    }
+    printf("\n");
 
     /* Register signal handler */
     signal(SIGINT, signal_handler);
