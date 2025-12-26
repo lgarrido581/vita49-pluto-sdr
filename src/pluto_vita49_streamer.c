@@ -85,13 +85,30 @@ static sdr_config_t g_sdr_config = {
 
 /* Statistics */
 typedef struct {
+    // Existing fields
     uint64_t packets_sent;
     uint64_t bytes_sent;
     uint32_t contexts_sent;
     uint32_t reconfigs;
-} stats_t;
 
-static stats_t g_stats = {0};
+    // NEW: Health monitoring
+    uint64_t underflows;
+    uint64_t overflows;
+    uint64_t refill_failures;
+    uint64_t send_failures;
+    uint64_t timestamp_jumps;
+    uint64_t last_timestamp_us;
+
+    // NEW: Performance metrics
+    uint64_t min_loop_time_us;
+    uint64_t max_loop_time_us;
+    uint64_t total_loop_time_us;
+    uint64_t loop_iterations;
+
+    pthread_mutex_t mutex;
+} stream_statistics_t;
+
+static stream_statistics_t g_stats = {0};
 
 /* VITA49 Packet Structures */
 #pragma pack(push, 1)
@@ -207,18 +224,26 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     uint32_t ts_int = ts_us / 1000000;
     uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;  /* Convert to picoseconds */
 
+    /* Get current health status */
+    pthread_mutex_lock(&g_stats.mutex);
+    uint64_t underflows = g_stats.underflows;
+    uint64_t overflows = g_stats.overflows;
+    pthread_mutex_unlock(&g_stats.mutex);
+
     /* Context Indicator Field (CIF) */
     uint32_t cif = 0;
     cif |= (1 << 29);  /* bandwidth */
     cif |= (1 << 27);  /* rf_reference_frequency */
-    cif |= (1 << 21);  /* sample_rate */
     cif |= (1 << 23);  /* gain */
+    cif |= (1 << 21);  /* sample_rate */
+    cif |= (1 << 19);  /* state_event_indicators */
 
     /* Encode context fields in DESCENDING CIF bit order (VITA49 requirement)
      * Bit 29: Bandwidth
      * Bit 27: RF Reference Frequency
      * Bit 23: Gain (comes BEFORE bit 21!)
      * Bit 21: Sample Rate
+     * Bit 19: State/Event Indicators
      *
      * NOTE: Use memcpy to avoid alignment issues with uint64_t at non-8-byte offsets
      */
@@ -249,6 +274,23 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     uint64_t rate_be = htonll(rate_fixed);
     memcpy(payload + payload_len, &rate_be, 8);
     payload_len += 8;
+
+    /* Bit 19: State/Event Indicators (32-bit field)
+     * Bit 31: Calibrated Time (1 = time is calibrated)
+     * Bit 19: Overrange (1 = overflow detected)
+     * Bit 18: Sample Loss (1 = underflow/sample loss detected)
+     */
+    uint32_t state_event = 0;
+    state_event |= (1U << 31);  /* Calibrated Time */
+    if (overflows > 0) {
+        state_event |= (1 << 19);  /* Overrange indicator */
+    }
+    if (underflows > 0) {
+        state_event |= (1 << 18);  /* Sample Loss indicator */
+    }
+    uint32_t state_event_be = htonl_custom(state_event);
+    memcpy(payload + payload_len, &state_event_be, 4);
+    payload_len += 4;
 
     /* DEBUG: Log what we're encoding */
     static int debug_count = 0;
@@ -467,7 +509,9 @@ static void *control_thread(void *arg) {
         printf("[Control] Added %s as subscriber (total: %d)\n", ip_str, g_subscriber_count);
         printf("[Control] ========================================\n\n");
 
+        pthread_mutex_lock(&g_stats.mutex);
         g_stats.reconfigs++;
+        pthread_mutex_unlock(&g_stats.mutex);
     }
 
     printf("[Control] Thread stopped\n");
@@ -563,7 +607,9 @@ static void *streaming_thread(void *arg) {
                 /* Send Context packet to notify all subscribers of the change */
                 encode_context_packet(packet_buf, &packet_len);
                 broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                pthread_mutex_lock(&g_stats.mutex);
                 g_stats.contexts_sent++;
+                pthread_mutex_unlock(&g_stats.mutex);
 
                 printf("[Streaming] Configuration applied successfully\n");
                 printf("[Streaming] Notified %d subscribers of config change\n", g_subscriber_count);
@@ -573,11 +619,21 @@ static void *streaming_thread(void *arg) {
             }
         }
 
-        /* Refill buffer */
+        /* Refill buffer with improved error handling */
+        uint64_t loop_start = get_timestamp_us();
         ssize_t nbytes = iio_buffer_refill(rxbuf);
         if (nbytes < 0) {
-            fprintf(stderr, "[Streaming] ERROR: Buffer refill failed\n");
-            break;
+            pthread_mutex_lock(&g_stats.mutex);
+            g_stats.refill_failures++;
+            uint64_t failures = g_stats.refill_failures;
+            pthread_mutex_unlock(&g_stats.mutex);
+
+            fprintf(stderr, "[Streaming] ERROR: Buffer refill failed (total failures: %llu)\n",
+                    (unsigned long long)failures);
+
+            /* Attempt recovery instead of breaking */
+            usleep(1000);  /* 1ms delay */
+            continue;
         }
 
         /* Get pointer to data */
@@ -586,11 +642,45 @@ static void *streaming_thread(void *arg) {
 
         size_t num_samples = nbytes / (2 * sizeof(int16_t));  /* IQ pairs */
 
+        /* Timestamp discontinuity detection */
+        uint64_t current_ts = get_timestamp_us();
+
+        pthread_mutex_lock(&g_stats.mutex);
+        if (g_stats.last_timestamp_us != 0) {
+            /* Calculate expected time delta based on sample count */
+            uint32_t sample_rate;
+            pthread_mutex_lock(&g_sdr_config.mutex);
+            sample_rate = g_sdr_config.sample_rate_hz;
+            pthread_mutex_unlock(&g_sdr_config.mutex);
+
+            uint64_t expected_delta_us = (num_samples * 1000000ULL) / sample_rate;
+            uint64_t actual_delta_us = current_ts - g_stats.last_timestamp_us;
+            int64_t delta_error = (int64_t)(actual_delta_us - expected_delta_us);
+
+            if (llabs(delta_error) > 10000) {  /* More than 10ms discrepancy */
+                g_stats.timestamp_jumps++;
+                fprintf(stderr, "[Streaming] WARNING: Timestamp jump detected: %lld us\n",
+                        (long long)delta_error);
+
+                if (delta_error > 0) {
+                    g_stats.underflows++;  /* Samples arrived late */
+                    fprintf(stderr, "[Streaming] WARNING: Possible UNDERFLOW detected\n");
+                } else {
+                    g_stats.overflows++;   /* Samples arrived early (shouldn't happen) */
+                    fprintf(stderr, "[Streaming] WARNING: Possible OVERFLOW detected\n");
+                }
+            }
+        }
+        g_stats.last_timestamp_us = current_ts;
+        pthread_mutex_unlock(&g_stats.mutex);
+
         /* Send context packet periodically */
         if (packets_since_context >= CONTEXT_INTERVAL) {
             encode_context_packet(packet_buf, &packet_len);
             broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+            pthread_mutex_lock(&g_stats.mutex);
             g_stats.contexts_sent++;
+            pthread_mutex_unlock(&g_stats.mutex);
             packets_since_context = 0;
         }
 
@@ -604,10 +694,25 @@ static void *streaming_thread(void *arg) {
 
             broadcast_to_subscribers(data_sock, packet_buf, packet_len);
 
+            pthread_mutex_lock(&g_stats.mutex);
             g_stats.packets_sent++;
             g_stats.bytes_sent += packet_len;
+            pthread_mutex_unlock(&g_stats.mutex);
             packets_since_context++;
         }
+
+        /* Loop timing measurements */
+        uint64_t loop_time = get_timestamp_us() - loop_start;
+        pthread_mutex_lock(&g_stats.mutex);
+        if (loop_time < g_stats.min_loop_time_us || g_stats.min_loop_time_us == 0) {
+            g_stats.min_loop_time_us = loop_time;
+        }
+        if (loop_time > g_stats.max_loop_time_us) {
+            g_stats.max_loop_time_us = loop_time;
+        }
+        g_stats.total_loop_time_us += loop_time;
+        g_stats.loop_iterations++;
+        pthread_mutex_unlock(&g_stats.mutex);
     }
 
     printf("[Streaming] Stopped\n");
@@ -678,6 +783,9 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    /* Initialize statistics mutex */
+    pthread_mutex_init(&g_stats.mutex, NULL);
+
     /* Create IIO context */
     struct iio_context *ctx = iio_create_local_context();
     if (!ctx) {
@@ -723,10 +831,36 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
     /* Monitor */
     while (g_running) {
         sleep(5);
+
+        pthread_mutex_lock(&g_stats.mutex);
+        uint64_t packets = g_stats.packets_sent;
+        uint64_t bytes = g_stats.bytes_sent;
+        uint32_t contexts = g_stats.contexts_sent;
+        uint64_t underflows = g_stats.underflows;
+        uint64_t overflows = g_stats.overflows;
+        uint64_t refill_fails = g_stats.refill_failures;
+        uint64_t ts_jumps = g_stats.timestamp_jumps;
+        uint64_t min_loop = g_stats.min_loop_time_us;
+        uint64_t max_loop = g_stats.max_loop_time_us;
+        double avg_loop = g_stats.loop_iterations > 0 ?
+            (double)g_stats.total_loop_time_us / g_stats.loop_iterations : 0;
+        pthread_mutex_unlock(&g_stats.mutex);
+
         printf("[Stats] Packets: %llu, Bytes: %llu MB, Contexts: %u, Subs: %d\n",
-               (unsigned long long)g_stats.packets_sent,
-               (unsigned long long)(g_stats.bytes_sent / 1048576),
-               g_stats.contexts_sent, g_subscriber_count);
+               (unsigned long long)packets,
+               (unsigned long long)(bytes / 1048576),
+               contexts, g_subscriber_count);
+
+        printf("[Health] Underflows: %llu, Overflows: %llu, Refill Fails: %llu, TS Jumps: %llu\n",
+               (unsigned long long)underflows,
+               (unsigned long long)overflows,
+               (unsigned long long)refill_fails,
+               (unsigned long long)ts_jumps);
+
+        printf("[Timing] Loop: avg=%.1f us, min=%llu us, max=%llu us\n",
+               avg_loop,
+               (unsigned long long)min_loop,
+               (unsigned long long)max_loop);
     }
 
     /* Cleanup */
@@ -735,6 +869,7 @@ int main(int argc __attribute__((unused)), char **argv __attribute__((unused))) 
 
     close(control_sock);
     iio_context_destroy(ctx);
+    pthread_mutex_destroy(&g_stats.mutex);
 
     printf("\n✓ Stopped\n");
     return 0;
