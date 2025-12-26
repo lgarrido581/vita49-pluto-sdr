@@ -9,6 +9,7 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
   const plotInstanceRef = useRef(null)
   const [maxHoldEnabled, setMaxHoldEnabled] = useState(false)
   const [maxHoldData, setMaxHoldData] = useState(null)
+  const [plotReady, setPlotReady] = useState(false)
 
   // Track render performance
   useEffect(() => {
@@ -102,6 +103,7 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
     }
 
     plotInstanceRef.current = new uPlot(opts, [[0], [0], [0]], chartRef.current)
+    setPlotReady(true)  // Signal that plot is ready for data updates
 
     // Handle window resize
     const handleResize = () => {
@@ -121,6 +123,7 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
         plotInstanceRef.current.destroy()
         plotInstanceRef.current = null
       }
+      setPlotReady(false)
     }
   }, []) // Only on mount!
 
@@ -143,9 +146,9 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
     plotInstanceRef.current.setSeries(2, { show: maxHoldEnabled })
   }, [maxHoldEnabled])
 
-  // Update chart data when spectrum data changes
+  // Update chart data when spectrum data changes or plot becomes ready
   useEffect(() => {
-    if (!plotInstanceRef.current || !spectrumData || !spectrumData.frequencies || !spectrumData.spectrum) {
+    if (!plotReady || !plotInstanceRef.current || !spectrumData || !spectrumData.frequencies || !spectrumData.spectrum) {
       return
     }
 
@@ -171,7 +174,7 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
     } catch (err) {
       console.error('Error updating uPlot:', err)
     }
-  }, [spectrumData, maxHoldData])
+  }, [plotReady, spectrumData, maxHoldData])
 
   const handleMaxHoldToggle = () => {
     setMaxHoldEnabled(!maxHoldEnabled)
