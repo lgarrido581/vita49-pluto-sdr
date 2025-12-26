@@ -12,5 +12,5 @@ cat vita49_streamer | ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
 # Run commands on the Pluto
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -tt root@pluto.local << 'EOF'
 chmod 777 vita49_streamer
-./vita49_streamer &
+./vita49_streamer
 EOF

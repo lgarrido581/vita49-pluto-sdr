@@ -58,9 +58,6 @@ chmod +x vita49_streamer
 # Run with default settings (Standard Ethernet MTU 1500)
 ./vita49_streamer &
 
-# OR: Run with jumbo frames for maximum performance
-./vita49_streamer --jumbo &
-
 # OR: Run with custom MTU (e.g., for PPPoE)
 ./vita49_streamer --mtu 1492 &
 
@@ -333,7 +330,8 @@ The streamer automatically optimizes UDP packet sizes to prevent IP fragmentatio
 ```bash
 ./vita49_streamer              # Standard Ethernet (MTU 1500)
 ./vita49_streamer --jumbo      # Jumbo frames (MTU 9000)
-./vita49_streamer --mtu 1492   # Custom MTU (e.g., PPPoE)
+# JUMBO is actually NOT supported by Pluto Ethernet interface
+# ./vita49_streamer --mtu 1492   # Custom MTU (e.g., PPPoE)
 ./vita49_streamer --help       # Show all options
 ```
 
@@ -342,18 +340,7 @@ The streamer automatically optimizes UDP packet sizes to prevent IP fragmentatio
 | MTU Type | MTU (bytes) | Samples/Packet | Efficiency | Packets/sec @ 30 MSPS |
 |----------|-------------|----------------|------------|-----------------------|
 | Standard | 1500 | 364 | 98.7% | 82,418 |
-| Jumbo | 9000 | 2244 | 99.9% | 13,369 |
 
-**Benefits of Jumbo Frames:**
-- 6x fewer packets per second (reduced CPU overhead)
-- 20x less packet overhead (99.9% vs 98.7% efficiency)
-- No IP fragmentation (improved reliability)
-- Lower latency (fewer interrupt handlers)
-
-**Requirements for Jumbo Frames:**
-- All network equipment must support MTU 9000
-- Configure network interface: `ip link set eth0 mtu 9000`
-- Test path support: `ping -M do -s 8972 <destination>`
 
 See [docs/PACKET_OPTIMIZATION.md](docs/PACKET_OPTIMIZATION.md) for detailed information.
 
