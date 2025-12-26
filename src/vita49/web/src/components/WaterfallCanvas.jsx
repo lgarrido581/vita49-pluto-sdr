@@ -24,13 +24,33 @@ export default function WaterfallCanvas({ waterfallData, metadata, perfMonitor }
       return
     }
 
+    // Validate we have actual data in first row
+    if (!waterfallData.waterfall[0] || waterfallData.waterfall[0].length === 0) {
+      console.warn('Skipping canvas update - empty waterfall row')
+      return
+    }
+
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d', { alpha: false })
     const container = containerRef.current
 
-    // Set canvas size to match container
-    const width = container.clientWidth
-    const height = container.clientHeight
+    if (!container) {
+      return
+    }
+
+    try {
+      // Use RAF to ensure timing is correct and avoid race conditions
+      requestAnimationFrame(() => {
+        if (!canvasRef.current || !containerRef.current) return
+
+        // Set canvas size to match container
+        const width = container.clientWidth
+        const height = container.clientHeight
+
+        if (width === 0 || height === 0) {
+          console.warn('Skipping canvas update - zero dimensions')
+          return
+        }
 
     // Use device pixel ratio for crisp rendering on high-DPI displays
     const dpr = window.devicePixelRatio || 1
@@ -117,7 +137,10 @@ export default function WaterfallCanvas({ waterfallData, metadata, perfMonitor }
       const x = width * i / (numMarkers - 1)
       ctx.fillText(`${freq.toFixed(1)}`, x, height - 5)
     }
-
+      })
+    } catch (err) {
+      console.error('Error rendering waterfall canvas:', err)
+    }
   }, [waterfallData, metadata])
 
   // Handle window resize

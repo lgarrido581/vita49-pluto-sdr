@@ -147,11 +147,20 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
       return
     }
 
-    const data = maxHoldEnabled && maxHoldData && maxHoldData.length > 0
-      ? [spectrumData.frequencies, spectrumData.spectrum, maxHoldData]
-      : [spectrumData.frequencies, spectrumData.spectrum]
+    try {
+      const data = maxHoldEnabled && maxHoldData && maxHoldData.length > 0
+        ? [spectrumData.frequencies, spectrumData.spectrum, maxHoldData]
+        : [spectrumData.frequencies, spectrumData.spectrum]
 
-    plotInstanceRef.current.setData(data)
+      // Use requestAnimationFrame to ensure DOM is ready and avoid race conditions
+      requestAnimationFrame(() => {
+        if (plotInstanceRef.current) {
+          plotInstanceRef.current.setData(data)
+        }
+      })
+    } catch (err) {
+      console.error('Error updating uPlot:', err)
+    }
   }, [spectrumData, maxHoldData, maxHoldEnabled])
 
   const handleMaxHoldToggle = () => {
