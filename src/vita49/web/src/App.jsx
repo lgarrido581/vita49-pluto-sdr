@@ -2,8 +2,8 @@ import React, { useState, useEffect } from 'react'
 import { useWebSocket } from './hooks/useWebSocket'
 import { usePerformanceMonitor } from './hooks/usePerformanceMonitor'
 import ControlPanel from './components/ControlPanel'
-import SpectrumPlot from './components/SpectrumPlot'
-import Waterfall from './components/Waterfall'
+import SpectrumPlotUPlot from './components/SpectrumPlotUPlot'
+import WaterfallCanvas from './components/WaterfallCanvas'
 import PacketInspector from './components/PacketInspector'
 import Statistics from './components/Statistics'
 import PerformanceStats from './components/PerformanceStats'
@@ -161,10 +161,10 @@ function App() {
         <section className="main-content">
           <div className="plot-grid">
             <div className="plot-item spectrum">
-              <SpectrumPlot spectrumData={spectrumData} metadata={metadata} perfMonitor={perfMonitor} />
+              <SpectrumPlotUPlot spectrumData={spectrumData} metadata={metadata} perfMonitor={perfMonitor} />
             </div>
             <div className="plot-item waterfall">
-              <Waterfall waterfallData={waterfallData} metadata={metadata} perfMonitor={perfMonitor} />
+              <WaterfallCanvas waterfallData={waterfallData} metadata={metadata} perfMonitor={perfMonitor} />
             </div>
           </div>
 
