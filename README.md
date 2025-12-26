@@ -12,6 +12,7 @@ Stream IQ samples from Pluto to your PC over Ethernet/WiFi using the VITA49 stan
 - **Multiple Receivers**: Unlimited simultaneous receivers on the same stream
 - **Standards Compliant**: Full VITA 49.0 implementation (Signal Data + Context packets)
 - **Cross-Platform**: Build on Linux, macOS, Windows (via WSL/Docker)
+- **🆕 MTU Optimization**: Automatically sizes packets to prevent IP fragmentation (standard/jumbo frames)
 
 ## Quick Start
 
@@ -53,17 +54,34 @@ ssh root@pluto.local
 
 # Make executable and run in background
 chmod +x vita49_streamer
+
+# Run with default settings (Standard Ethernet MTU 1500)
 ./vita49_streamer &
+
+# OR: Run with jumbo frames for maximum performance
+./vita49_streamer --jumbo &
+
+# OR: Run with custom MTU (e.g., for PPPoE)
+./vita49_streamer --mtu 1492 &
 
 # Verify it's running
 ps | grep vita49
 ```
 
-**Output when streamer starts:**
+**Output when streamer starts (with MTU optimization):**
 ```
-VITA49 Streamer Started
-Listening for config on port 4990
-Ready to stream on port 4991
+========================================
+VITA49 Standalone Streamer for Pluto
+========================================
+MTU: 1500 bytes
+Samples per packet: 364
+VITA49 packet size: 1480 bytes
+UDP datagram size: 1480 bytes
+✓ Packet fits in MTU (efficiency: 98.7%)
+
+IIO context created
+Control port: 4990
+Data port: 4991
 ```
 
 ### Step 3: Install Python Library (First Time Only)
@@ -174,6 +192,7 @@ See **[QUICKSTART_WEB_UI.md](QUICKSTART_WEB_UI.md)** for detailed setup instruct
 - **[Quick Start Guide](docs/USAGE.md)** - Deploy and use the streamer
 - **[Build Guide](docs/BUILD.md)** - Build for all platforms (Linux/macOS/Windows)
 - **[Development Guide](docs/DEVELOPMENT.md)** - Architecture, testing, contributing
+- **[Packet Optimization Guide](docs/PACKET_OPTIMIZATION.md)** - MTU optimization and performance tuning
 - **[Web UI Quick Start](QUICKSTART_WEB_UI.md)** - Browser-based interface setup
 
 ## Installation
@@ -304,6 +323,39 @@ Tested on ADALM-Pluto:
 | **Latency** | 1-2 ms (UDP + buffering) |
 | **Sample Rate** | 2-61 MSPS (AD9361 range) |
 | **Network Bandwidth** | ~240 Mbps @ 30 MSPS |
+
+## MTU Optimization
+
+The streamer automatically optimizes UDP packet sizes to prevent IP fragmentation and maximize throughput.
+
+### Command-Line Options
+
+```bash
+./vita49_streamer              # Standard Ethernet (MTU 1500)
+./vita49_streamer --jumbo      # Jumbo frames (MTU 9000)
+./vita49_streamer --mtu 1492   # Custom MTU (e.g., PPPoE)
+./vita49_streamer --help       # Show all options
+```
+
+### Performance by MTU
+
+| MTU Type | MTU (bytes) | Samples/Packet | Efficiency | Packets/sec @ 30 MSPS |
+|----------|-------------|----------------|------------|-----------------------|
+| Standard | 1500 | 364 | 98.7% | 82,418 |
+| Jumbo | 9000 | 2244 | 99.9% | 13,369 |
+
+**Benefits of Jumbo Frames:**
+- 6x fewer packets per second (reduced CPU overhead)
+- 20x less packet overhead (99.9% vs 98.7% efficiency)
+- No IP fragmentation (improved reliability)
+- Lower latency (fewer interrupt handlers)
+
+**Requirements for Jumbo Frames:**
+- All network equipment must support MTU 9000
+- Configure network interface: `ip link set eth0 mtu 9000`
+- Test path support: `ping -M do -s 8972 <destination>`
+
+See [docs/PACKET_OPTIMIZATION.md](docs/PACKET_OPTIMIZATION.md) for detailed information.
 
 ## Repository Structure
 
