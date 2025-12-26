@@ -26,6 +26,8 @@ export function usePerformanceMonitor(enabled = true) {
   const messageLatenciesRef = useRef([])
   const renderTimesRef = useRef([])
   const messageReceiveTimesRef = useRef({})
+  const lastSequenceNumbersRef = useRef({})
+  const droppedMessagesCountRef = useRef(0)
 
   // FPS monitoring
   useEffect(() => {
@@ -55,8 +57,9 @@ export function usePerformanceMonitor(enabled = true) {
         const minFrameTime = Math.min(...frameTimes)
         const fps = 1000 / avgFrameTime
 
-        // Dropped frames = frames that took >16.67ms (60 FPS threshold)
-        const droppedFrames = frameTimes.filter(t => t > 16.67).length
+        // Dropped messages = messages skipped due to out-of-order sequence numbers
+        const droppedMessages = droppedMessagesCountRef.current
+        droppedMessagesCountRef.current = 0
 
         // Memory usage (if available)
         const memoryUsage = performance.memory
@@ -79,7 +82,7 @@ export function usePerformanceMonitor(enabled = true) {
           maxFrameTime: maxFrameTime.toFixed(2),
           minFrameTime: minFrameTime.toFixed(2),
           renderCount: frameCountRef.current,
-          droppedFrames,
+          droppedFrames: droppedMessages,
           memoryUsage,
           messagesPerSec,
           avgMessageLatency: avgMessageLatency.toFixed(2),
@@ -135,6 +138,15 @@ export function usePerformanceMonitor(enabled = true) {
     if (messageType && sequence !== undefined) {
       const key = `${messageType}_${sequence}`
 
+      // Check for sequence gaps (dropped messages)
+      const lastSeq = lastSequenceNumbersRef.current[messageType]
+      if (lastSeq !== undefined && sequence > lastSeq + 1) {
+        const dropped = sequence - lastSeq - 1
+        droppedMessagesCountRef.current += dropped
+        console.debug(`Detected ${dropped} dropped ${messageType} messages (gap: ${lastSeq} -> ${sequence})`)
+      }
+      lastSequenceNumbersRef.current[messageType] = sequence
+
       // If we have a receive time for this message, calculate processing delay
       if (messageReceiveTimesRef.current[key]) {
         const processingDelay = performance.now() - messageReceiveTimesRef.current[key]
@@ -179,6 +191,8 @@ export function usePerformanceMonitor(enabled = true) {
     messageCountRef.current = 0
     messageLatenciesRef.current = []
     renderTimesRef.current = []
+    lastSequenceNumbersRef.current = {}
+    droppedMessagesCountRef.current = 0
     setStats({
       fps: 0,
       avgFrameTime: 0,

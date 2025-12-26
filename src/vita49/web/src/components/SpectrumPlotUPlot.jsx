@@ -135,7 +135,19 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
       return
     }
 
-    const data = maxHoldEnabled && maxHoldData
+    // Validate data arrays are not empty
+    if (spectrumData.frequencies.length === 0 || spectrumData.spectrum.length === 0) {
+      console.warn('Skipping uPlot update - empty data arrays')
+      return
+    }
+
+    // Validate arrays have matching lengths
+    if (spectrumData.frequencies.length !== spectrumData.spectrum.length) {
+      console.warn('Skipping uPlot update - mismatched array lengths')
+      return
+    }
+
+    const data = maxHoldEnabled && maxHoldData && maxHoldData.length > 0
       ? [spectrumData.frequencies, spectrumData.spectrum, maxHoldData]
       : [spectrumData.frequencies, spectrumData.spectrum]
 

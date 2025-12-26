@@ -160,7 +160,6 @@ class VITA49WebHandler:
         self._last_broadcast_time = 0.0
         self._broadcast_interval = 1.0 / self.update_rate_hz
         self._spectrum_avg_buffer = deque(maxlen=self.averaging)
-        self._pending_broadcast = False
         self._spectrum_sequence = 0
         self._waterfall_sequence = 0
 
@@ -298,15 +297,9 @@ class VITA49WebHandler:
 
     async def _process_and_broadcast(self):
         """Process samples and broadcast to clients"""
-        # Frame dropping: Skip if previous broadcast is still pending
-        if self._pending_broadcast:
-            logger.debug("Skipping frame - previous broadcast still pending")
-            return
-
         if len(self.sample_buffer) < self.fft_size:
             return
 
-        self._pending_broadcast = True
         try:
             # Get samples - optimize by avoiding list() conversion
             # Convert deque directly to numpy array for better performance
@@ -377,9 +370,8 @@ class VITA49WebHandler:
                     }
                 })
 
-        finally:
-            # Reset pending flag
-            self._pending_broadcast = False
+        except Exception as e:
+            logger.error(f"Error processing and broadcasting data: {e}")
 
     def get_stats(self) -> dict:
         """Get current statistics"""

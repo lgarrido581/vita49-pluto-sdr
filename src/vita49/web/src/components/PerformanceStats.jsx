@@ -50,14 +50,14 @@ export default function PerformanceStats({ stats, componentStats, onReset }) {
           </div>
         </div>
 
-        {/* Dropped Frames */}
+        {/* Dropped Messages */}
         <div className="perf-item">
-          <div className="perf-label">Dropped Frames</div>
+          <div className="perf-label">Dropped Messages</div>
           <div className="perf-value" style={{ color: stats.droppedFrames > 5 ? '#ef4444' : '#10b981' }}>
             {stats.droppedFrames}
           </div>
           <div className="perf-detail">
-            Last 60 frames
+            Sequence gaps / sec
           </div>
         </div>
 
