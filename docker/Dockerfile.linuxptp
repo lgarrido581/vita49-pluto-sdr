@@ -1,0 +1,89 @@
+FROM ubuntu:18.04
+
+# Install ARM cross-compiler and build tools
+RUN apt-get update && apt-get install -y \
+    gcc-arm-linux-gnueabihf \
+    make \
+    git \
+    file \
+    python3 \
+    linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up environment for cross-compilation
+ENV CROSS_COMPILE=arm-linux-gnueabihf-
+ENV CC=${CROSS_COMPILE}gcc
+
+WORKDIR /build
+
+# Clone linuxptp
+RUN git clone https://github.com/richardcochran/linuxptp.git
+
+# Set working directory to linuxptp
+WORKDIR /build/linuxptp
+
+# Create patch script during build phase
+RUN cat > /build/patch_missing.py << 'EOF'
+import re
+
+with open('missing.h', 'r') as f:
+    lines = f.readlines()
+
+# Track if we're inside an enum block
+output_lines = []
+in_enum = False
+enum_start_line = -1
+enum_lines = []
+
+for i, line in enumerate(lines):
+    # Check if we're starting an enum
+    if re.match(r'enum\s+\w+\s*\{', line):
+        in_enum = True
+        enum_start_line = i
+        enum_lines = [line]
+    elif in_enum:
+        enum_lines.append(line)
+        # Check if we're ending the enum
+        if '};' in line or '}' in line:
+            # Check if the enum is empty (only has braces and whitespace)
+            enum_content = ''.join(enum_lines)
+            # Remove the enum declaration and braces, see what's left
+            content_check = re.sub(r'enum\s+\w+\s*\{', '', enum_content)
+            content_check = re.sub(r'\s*\};?\s*', '', content_check)
+
+            # If nothing substantial is left, skip this enum entirely
+            if content_check.strip():
+                # Enum has content, keep it
+                output_lines.extend(enum_lines)
+            else:
+                # Empty enum, skip it
+                print(f"Removing empty enum at lines {enum_start_line+1}-{i+1}")
+
+            in_enum = False
+            enum_lines = []
+    else:
+        output_lines.append(line)
+
+with open('missing.h', 'w') as f:
+    f.writelines(output_lines)
+
+print("Patched missing.h to remove empty enum definitions")
+EOF
+
+# Build linuxptp (this will be executed when container runs)
+CMD python3 /build/patch_missing.py && \
+    echo "=== Showing missing.h around line 65 ===" && \
+    sed -n '60,70p' missing.h && \
+    echo "========================================" && \
+    make clean && make && \
+    echo "" && \
+    echo "========================================" && \
+    echo "Build complete! Binaries created:" && \
+    echo "========================================" && \
+    ls -lh ptp4l phc2sys && \
+    file ptp4l && \
+    echo "" && \
+    echo "Copying binaries to /output..." && \
+    mkdir -p /output && \
+    cp ptp4l phc2sys /output/ && \
+    echo "✓ Done! Binaries available in output/"
