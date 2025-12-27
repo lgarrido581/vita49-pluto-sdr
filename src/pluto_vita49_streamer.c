@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <signal.h>
 #include <iio.h>
 
@@ -48,6 +49,17 @@
 #define SUBSCRIBER_TIMEOUT_US       30000000    /* 30 seconds */
 #define MAX_CONSECUTIVE_FAILURES    10          /* Remove after 10 failures */
 #define SUBSCRIBER_CLEANUP_INTERVAL 100         /* Check every 100 packets */
+
+/* Buffer Timing Configuration (Rate Control) */
+#define BUFFER_TIME_US              5000        /* Target 5ms of samples per buffer */
+#define MIN_BUFFER_SAMPLES          4096        /* Minimum for efficiency */
+#define MAX_BUFFER_SAMPLES          65536       /* Maximum for memory/latency */
+#define BUFFER_TIME_TOLERANCE       0.1         /* 10% tolerance on timing */
+
+/* Rate Control Pacing Modes */
+#define PACING_MODE_STRICT          0           /* Always wait for correct send time */
+#define PACING_MODE_RELAXED         1           /* Send immediately if within 10% */
+#define PACING_MODE_NONE            2           /* Disable rate control (legacy) */
 
 /* MTU and Packet Size Configuration */
 #define MTU_STANDARD            1500            /* Standard Ethernet */
@@ -112,13 +124,13 @@ static sdr_config_t g_sdr_config = {
 
 /* Statistics */
 typedef struct {
-    // Existing fields
+    /* Packet stats */
     uint64_t packets_sent;
     uint64_t bytes_sent;
     uint32_t contexts_sent;
     uint32_t reconfigs;
 
-    // NEW: Health monitoring
+    /* Health monitoring */
     uint64_t underflows;
     uint64_t overflows;
     uint64_t refill_failures;
@@ -126,16 +138,39 @@ typedef struct {
     uint64_t timestamp_jumps;
     uint64_t last_timestamp_us;
 
-    // NEW: Performance metrics
+    /* Performance metrics */
     uint64_t min_loop_time_us;
     uint64_t max_loop_time_us;
     uint64_t total_loop_time_us;
     uint64_t loop_iterations;
 
+    /* Rate control metrics */
+    uint64_t packets_on_time;       /* Packets sent at or before target time */
+    uint64_t packets_late;          /* Packets sent after target time */
+    uint64_t total_lateness_ns;     /* Cumulative lateness for averaging */
+    uint64_t max_lateness_ns;       /* Worst-case lateness */
+    uint64_t total_early_ns;        /* Cumulative early time (for pacing efficiency) */
+
+    /* Buffer metrics */
+    uint64_t buffer_refills;        /* Total buffer refills */
+    uint64_t buffer_overruns;       /* Times refill completed before send finished */
+
     pthread_mutex_t mutex;
 } stream_statistics_t;
 
 static stream_statistics_t g_stats = {0};
+
+/* Rate Controller */
+typedef struct {
+    uint32_t sample_rate_hz;        /* Current sample rate */
+    size_t samples_per_packet;      /* Samples in each VITA49 packet */
+    uint64_t packet_interval_ns;    /* Nanoseconds between packet sends */
+    uint64_t buffer_start_ns;       /* Timestamp when buffer refill completed */
+    uint64_t samples_sent;          /* Running count for timing calculation */
+    int pacing_mode;                /* PACING_MODE_STRICT, RELAXED, or NONE */
+} rate_controller_t;
+
+static rate_controller_t g_rate_ctrl = {0};
 
 /* VITA49 Packet Structures */
 #pragma pack(push, 1)
@@ -164,7 +199,12 @@ static int send_to_subscriber(int sock, uint8_t *buf, size_t len, subscriber_t *
 static void cleanup_dead_subscribers(void);
 static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len);
 static uint64_t get_timestamp_us(void);
+static uint64_t get_timestamp_ns(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
+static size_t calculate_buffer_size(uint32_t sample_rate_hz);
+static void rate_controller_init(uint32_t sample_rate_hz, size_t samples_per_packet, int pacing_mode);
+static void rate_controller_start_buffer(void);
+static uint64_t rate_controller_wait_for_packet(size_t packet_index);
 static void encode_context_packet(uint8_t *buf, size_t *len);
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count);
 static void *control_thread(void *arg);
@@ -185,6 +225,157 @@ static uint64_t get_timestamp_us(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+}
+
+/* Get current timestamp in nanoseconds (for precise rate control) */
+static uint64_t get_timestamp_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/**
+ * Calculate optimal buffer size for given sample rate
+ *
+ * The buffer should hold BUFFER_TIME_US worth of samples.
+ * At 30 MSPS: 5ms × 30M = 150,000 samples (too large)
+ * So we cap at MAX_BUFFER_SAMPLES and adjust timing accordingly.
+ *
+ * @param sample_rate_hz  Current sample rate in Hz
+ * @return Optimal buffer size in samples (I/Q pairs)
+ */
+static size_t calculate_buffer_size(uint32_t sample_rate_hz) {
+    /* Calculate samples for target buffer time */
+    size_t target_samples = (size_t)((uint64_t)sample_rate_hz * BUFFER_TIME_US / 1000000);
+
+    /* Clamp to valid range */
+    if (target_samples < MIN_BUFFER_SAMPLES) {
+        target_samples = MIN_BUFFER_SAMPLES;
+    }
+    if (target_samples > MAX_BUFFER_SAMPLES) {
+        target_samples = MAX_BUFFER_SAMPLES;
+    }
+
+    /* Round to power of 2 for DMA efficiency */
+    size_t power_of_2 = MIN_BUFFER_SAMPLES;
+    while (power_of_2 < target_samples && power_of_2 < MAX_BUFFER_SAMPLES) {
+        power_of_2 *= 2;
+    }
+
+    return power_of_2;
+}
+
+/**
+ * Initialize rate controller for current configuration
+ * Call after sample rate changes and before streaming loop
+ */
+static void rate_controller_init(uint32_t sample_rate_hz, size_t samples_per_packet, int pacing_mode) {
+    g_rate_ctrl.sample_rate_hz = sample_rate_hz;
+    g_rate_ctrl.samples_per_packet = samples_per_packet;
+    g_rate_ctrl.pacing_mode = pacing_mode;
+
+    /* Calculate interval between packets in nanoseconds
+     * interval_ns = (samples_per_packet / sample_rate_hz) * 1e9
+     * Use integer math to avoid floating point:
+     * interval_ns = samples_per_packet * 1,000,000,000 / sample_rate_hz
+     */
+    g_rate_ctrl.packet_interval_ns =
+        (uint64_t)samples_per_packet * 1000000000ULL / sample_rate_hz;
+
+    g_rate_ctrl.samples_sent = 0;
+    g_rate_ctrl.buffer_start_ns = 0;
+
+    const char *mode_str = "unknown";
+    switch (pacing_mode) {
+        case PACING_MODE_STRICT: mode_str = "strict"; break;
+        case PACING_MODE_RELAXED: mode_str = "relaxed"; break;
+        case PACING_MODE_NONE: mode_str = "none"; break;
+    }
+
+    printf("[RateCtrl] Initialized: %u Hz, %zu samples/pkt, %llu ns interval, mode=%s\n",
+           sample_rate_hz, samples_per_packet,
+           (unsigned long long)g_rate_ctrl.packet_interval_ns, mode_str);
+}
+
+/**
+ * Mark the start of a new buffer's transmission window
+ * Call immediately after iio_buffer_refill() returns
+ */
+static void rate_controller_start_buffer(void) {
+    g_rate_ctrl.buffer_start_ns = get_timestamp_ns();
+    g_rate_ctrl.samples_sent = 0;
+
+    pthread_mutex_lock(&g_stats.mutex);
+    g_stats.buffer_refills++;
+    pthread_mutex_unlock(&g_stats.mutex);
+}
+
+/**
+ * Wait until it's time to send the next packet
+ * Returns the target send time for timestamp calculation
+ *
+ * @param packet_index  Which packet in the current buffer (0-based)
+ * @return Target timestamp in nanoseconds, or 0 if we're behind schedule
+ */
+static uint64_t rate_controller_wait_for_packet(size_t packet_index) {
+    /* Skip pacing if disabled */
+    if (g_rate_ctrl.pacing_mode == PACING_MODE_NONE) {
+        return get_timestamp_ns();
+    }
+
+    /* Calculate when this packet should be sent */
+    uint64_t target_ns = g_rate_ctrl.buffer_start_ns +
+                         (packet_index * g_rate_ctrl.packet_interval_ns);
+
+    /* Get current time */
+    uint64_t now_ns = get_timestamp_ns();
+
+    if (now_ns < target_ns) {
+        /* We're ahead of schedule */
+        uint64_t sleep_ns = target_ns - now_ns;
+
+        /* Track early time for statistics */
+        pthread_mutex_lock(&g_stats.mutex);
+        g_stats.total_early_ns += sleep_ns;
+        g_stats.packets_on_time++;
+        pthread_mutex_unlock(&g_stats.mutex);
+
+        /* In relaxed mode, only sleep if more than 10% early */
+        if (g_rate_ctrl.pacing_mode == PACING_MODE_RELAXED) {
+            uint64_t tolerance_ns = g_rate_ctrl.packet_interval_ns / 10;
+            if (sleep_ns <= tolerance_ns) {
+                return target_ns;  /* Close enough, send now */
+            }
+        }
+
+        /* Only sleep if it's worth it (> 1 microsecond) */
+        if (sleep_ns > 1000) {
+            struct timespec sleep_ts;
+            sleep_ts.tv_sec = sleep_ns / 1000000000ULL;
+            sleep_ts.tv_nsec = sleep_ns % 1000000000ULL;
+            nanosleep(&sleep_ts, NULL);
+        }
+
+        return target_ns;
+    } else {
+        /* We're behind schedule - send immediately, track the slip */
+        uint64_t slip_ns = now_ns - target_ns;
+
+        pthread_mutex_lock(&g_stats.mutex);
+        g_stats.packets_late++;
+        g_stats.total_lateness_ns += slip_ns;
+        if (slip_ns > g_stats.max_lateness_ns) {
+            g_stats.max_lateness_ns = slip_ns;
+        }
+
+        /* If we've slipped by more than one packet interval, it's a significant underflow */
+        if (slip_ns > g_rate_ctrl.packet_interval_ns) {
+            g_stats.underflows++;
+        }
+        pthread_mutex_unlock(&g_stats.mutex);
+
+        return 0;  /* Indicates we're behind */
+    }
 }
 
 /* Calculate optimal samples per packet to fit within MTU */
@@ -691,7 +882,7 @@ static void *control_thread(void *arg) {
     return NULL;
 }
 
-/* Streaming thread - sends IQ data */
+/* Streaming thread - sends IQ data with rate control */
 static void *streaming_thread(void *arg) {
     struct iio_context *ctx = (struct iio_context *)arg;
     struct iio_device *dev = iio_context_find_device(ctx, "cf-ad9361-lpc");
@@ -706,12 +897,25 @@ static void *streaming_thread(void *arg) {
         return NULL;
     }
 
-    /* Create buffer */
-    struct iio_buffer *rxbuf = iio_device_create_buffer(dev, DEFAULT_BUFFER_SIZE, false);
+    /* Calculate and create appropriately sized buffer based on sample rate */
+    pthread_mutex_lock(&g_sdr_config.mutex);
+    uint32_t current_rate = g_sdr_config.sample_rate_hz;
+    pthread_mutex_unlock(&g_sdr_config.mutex);
+
+    size_t buffer_samples = calculate_buffer_size(current_rate);
+    struct iio_buffer *rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
     if (!rxbuf) {
         fprintf(stderr, "[Streaming] ERROR: Failed to create buffer\n");
         return NULL;
     }
+
+    printf("[Streaming] Created buffer: %zu samples (%.2f ms at %.1f MSPS)\n",
+           buffer_samples,
+           (double)buffer_samples * 1000.0 / current_rate,
+           current_rate / 1e6);
+
+    /* Initialize rate controller */
+    rate_controller_init(current_rate, g_samples_per_packet, g_rate_ctrl.pacing_mode);
 
     /* Create UDP socket for data */
     int data_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -721,7 +925,7 @@ static void *streaming_thread(void *arg) {
         return NULL;
     }
 
-    printf("[Streaming] Started\n");
+    printf("[Streaming] Started - rate-controlled mode\n");
 
     uint8_t packet_count = 0;
     int packets_since_context = 0;
@@ -753,13 +957,18 @@ static void *streaming_thread(void *arg) {
                 iio_buffer_destroy(rxbuf);
                 rxbuf = NULL;
 
+                /* Get new sample rate for buffer calculation */
+                pthread_mutex_lock(&g_sdr_config.mutex);
+                uint32_t new_rate = g_sdr_config.sample_rate_hz;
+                pthread_mutex_unlock(&g_sdr_config.mutex);
+
                 /* Apply new configuration to SDR hardware */
                 if (configure_sdr(ctx, dev) < 0) {
                     fprintf(stderr, "[Streaming] ERROR: Failed to apply new configuration\n");
                     fprintf(stderr, "[Streaming] ERROR: Keeping old configuration\n");
 
                     /* Try to recreate buffer with old settings */
-                    rxbuf = iio_device_create_buffer(dev, DEFAULT_BUFFER_SIZE, false);
+                    rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
                     if (!rxbuf) {
                         fprintf(stderr, "[Streaming] FATAL: Cannot recreate buffer - stopping\n");
                         break;
@@ -771,12 +980,17 @@ static void *streaming_thread(void *arg) {
                     continue;
                 }
 
-                /* Recreate buffer with new configuration */
-                rxbuf = iio_device_create_buffer(dev, DEFAULT_BUFFER_SIZE, false);
+                /* Recalculate buffer size for new sample rate */
+                buffer_samples = calculate_buffer_size(new_rate);
+                rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
                 if (!rxbuf) {
                     fprintf(stderr, "[Streaming] FATAL: Failed to recreate buffer - stopping\n");
                     break;
                 }
+
+                /* Reinitialize rate controller for new sample rate */
+                rate_controller_init(new_rate, g_samples_per_packet, g_rate_ctrl.pacing_mode);
+                current_rate = new_rate;
 
                 /* Clear the flag */
                 pthread_mutex_lock(&g_sdr_config.mutex);
@@ -790,6 +1004,10 @@ static void *streaming_thread(void *arg) {
                 g_stats.contexts_sent++;
                 pthread_mutex_unlock(&g_stats.mutex);
 
+                printf("[Streaming] Buffer resized: %zu samples (%.2f ms at %.1f MSPS)\n",
+                       buffer_samples,
+                       (double)buffer_samples * 1000.0 / new_rate,
+                       new_rate / 1e6);
                 printf("[Streaming] Configuration applied successfully\n");
                 printf("[Streaming] Notified %d subscribers of config change\n", g_subscriber_count);
                 printf("[Streaming] ========================================\n");
@@ -814,6 +1032,9 @@ static void *streaming_thread(void *arg) {
             usleep(1000);  /* 1ms delay */
             continue;
         }
+
+        /* Mark buffer start time for rate control */
+        rate_controller_start_buffer();
 
         /* Get pointer to data */
         int16_t *samples = (int16_t *)iio_buffer_first(rxbuf, iio_device_get_channel(dev, 0));
@@ -853,20 +1074,27 @@ static void *streaming_thread(void *arg) {
         g_stats.last_timestamp_us = current_ts;
         pthread_mutex_unlock(&g_stats.mutex);
 
-        /* Send context packet periodically */
-        if (packets_since_context >= CONTEXT_INTERVAL) {
-            encode_context_packet(packet_buf, &packet_len);
-            broadcast_to_subscribers(data_sock, packet_buf, packet_len);
-            pthread_mutex_lock(&g_stats.mutex);
-            g_stats.contexts_sent++;
-            pthread_mutex_unlock(&g_stats.mutex);
-            packets_since_context = 0;
-        }
-
-        /* Packetize and send */
+        /* Rate-Controlled Packet Transmission */
+        size_t packet_index = 0;
         for (size_t offset = 0; offset < num_samples; offset += g_samples_per_packet) {
+            /* Wait for correct send time (rate control) */
+            rate_controller_wait_for_packet(packet_index);
+
+            /* Check if we should stop */
+            if (!g_running) break;
+
             size_t chunk_size = (offset + g_samples_per_packet > num_samples) ?
                                (num_samples - offset) : g_samples_per_packet;
+
+            /* Send periodic context packets */
+            if (packets_since_context >= CONTEXT_INTERVAL) {
+                encode_context_packet(packet_buf, &packet_len);
+                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                pthread_mutex_lock(&g_stats.mutex);
+                g_stats.contexts_sent++;
+                pthread_mutex_unlock(&g_stats.mutex);
+                packets_since_context = 0;
+            }
 
             encode_data_packet(packet_buf, &packet_len, samples + offset * 2,
                              chunk_size, &packet_count);
@@ -879,6 +1107,7 @@ static void *streaming_thread(void *arg) {
             pthread_mutex_unlock(&g_stats.mutex);
             packets_since_context++;
             packets_sent++;
+            packet_index++;
         }
 
         /* Loop timing measurements */
@@ -955,9 +1184,11 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
 
 /* Main */
 int main(int argc, char **argv) {
-    /* Parse command-line arguments for MTU */
+    /* Parse command-line arguments */
     size_t mtu = MTU_STANDARD;  /* Default to standard Ethernet */
     bool use_jumbo = false;
+    int pacing_mode = PACING_MODE_STRICT;  /* Default to strict pacing */
+    bool timing_stats = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--jumbo") == 0) {
@@ -965,19 +1196,43 @@ int main(int argc, char **argv) {
             mtu = MTU_JUMBO;
         } else if (strcmp(argv[i], "--mtu") == 0 && i + 1 < argc) {
             mtu = (size_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--pacing-mode") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "strict") == 0) {
+                pacing_mode = PACING_MODE_STRICT;
+            } else if (strcmp(argv[i], "relaxed") == 0) {
+                pacing_mode = PACING_MODE_RELAXED;
+            } else if (strcmp(argv[i], "none") == 0) {
+                pacing_mode = PACING_MODE_NONE;
+            } else {
+                fprintf(stderr, "ERROR: Unknown pacing mode '%s'\n", argv[i]);
+                fprintf(stderr, "Valid modes: strict, relaxed, none\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--timing-stats") == 0) {
+            timing_stats = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
-            printf("  --jumbo           Use jumbo frames (MTU 9000)\n");
-            printf("  --mtu <size>      Set custom MTU size in bytes\n");
-            printf("  --help, -h        Show this help message\n");
+            printf("  --jumbo               Use jumbo frames (MTU 9000)\n");
+            printf("  --mtu <size>          Set custom MTU size in bytes\n");
+            printf("  --pacing-mode <mode>  Pacing mode: strict|relaxed|none (default: strict)\n");
+            printf("                        strict:  Always wait for correct send time\n");
+            printf("                        relaxed: Send immediately if within 10%% of target\n");
+            printf("                        none:    Disable rate control (legacy mode)\n");
+            printf("  --timing-stats        Enable detailed timing statistics\n");
+            printf("  --help, -h            Show this help message\n");
             printf("\nExamples:\n");
-            printf("  %s                # Standard MTU (1500 bytes)\n", argv[0]);
-            printf("  %s --jumbo        # Jumbo frames (9000 bytes)\n", argv[0]);
-            printf("  %s --mtu 1492     # PPPoE MTU\n", argv[0]);
+            printf("  %s                    # Standard MTU, strict pacing\n", argv[0]);
+            printf("  %s --jumbo            # Jumbo frames (9000 bytes)\n", argv[0]);
+            printf("  %s --mtu 1492         # PPPoE MTU\n", argv[0]);
+            printf("  %s --pacing-mode none # Disable rate control\n", argv[0]);
             return 0;
         }
     }
+
+    /* Initialize rate controller pacing mode */
+    g_rate_ctrl.pacing_mode = pacing_mode;
 
     /* Calculate optimal packet size based on MTU */
     g_samples_per_packet = calculate_optimal_samples_per_packet(mtu);
@@ -987,19 +1242,30 @@ int main(int argc, char **argv) {
     size_t total_vita49_packet = packet_payload + VITA49_OVERHEAD;
     size_t total_udp_datagram = total_vita49_packet + IP_UDP_OVERHEAD;
 
+    /* Determine pacing mode string */
+    const char *pacing_mode_str = "unknown";
+    switch (pacing_mode) {
+        case PACING_MODE_STRICT: pacing_mode_str = "strict"; break;
+        case PACING_MODE_RELAXED: pacing_mode_str = "relaxed"; break;
+        case PACING_MODE_NONE: pacing_mode_str = "none (legacy)"; break;
+    }
+
     printf("========================================\n");
     printf("VITA49 Standalone Streamer for Pluto\n");
+    printf("  Rate-Controlled Edition\n");
     printf("========================================\n");
     printf("MTU: %zu bytes%s\n", mtu, use_jumbo ? " (Jumbo frames)" : "");
     printf("Samples per packet: %zu\n", g_samples_per_packet);
     printf("VITA49 packet size: %zu bytes\n", total_vita49_packet);
     printf("UDP datagram size: %zu bytes\n", total_udp_datagram);
+    printf("Pacing mode: %s\n", pacing_mode_str);
+    printf("Timing stats: %s\n", timing_stats ? "enabled" : "disabled");
 
     if (total_udp_datagram > mtu) {
         fprintf(stderr, "WARNING: Packet size exceeds MTU! Will fragment.\n");
     } else {
         double efficiency = 100.0 * total_udp_datagram / mtu;
-        printf("✓ Packet fits in MTU (efficiency: %.1f%%)\n", efficiency);
+        printf("Packet fits in MTU (efficiency: %.1f%%)\n", efficiency);
     }
     printf("\n");
 
@@ -1068,6 +1334,13 @@ int main(int argc, char **argv) {
         uint64_t max_loop = g_stats.max_loop_time_us;
         double avg_loop = g_stats.loop_iterations > 0 ?
             (double)g_stats.total_loop_time_us / g_stats.loop_iterations : 0;
+
+        /* Rate control statistics */
+        uint64_t packets_on_time = g_stats.packets_on_time;
+        uint64_t packets_late = g_stats.packets_late;
+        uint64_t total_lateness_ns = g_stats.total_lateness_ns;
+        uint64_t max_lateness_ns = g_stats.max_lateness_ns;
+        uint64_t buffer_refills = g_stats.buffer_refills;
         pthread_mutex_unlock(&g_stats.mutex);
 
         printf("[Stats] Packets: %llu, Bytes: %llu MB, Contexts: %u, Subs: %d\n",
@@ -1085,6 +1358,25 @@ int main(int argc, char **argv) {
                avg_loop,
                (unsigned long long)min_loop,
                (unsigned long long)max_loop);
+
+        /* Rate control statistics */
+        uint64_t total_paced = packets_on_time + packets_late;
+        if (total_paced > 0) {
+            double on_time_pct = 100.0 * packets_on_time / total_paced;
+            double avg_lateness_us = packets_late > 0 ?
+                (double)total_lateness_ns / packets_late / 1000.0 : 0;
+            printf("[RateCtrl] On-time: %.1f%%, Late: %llu, Avg late: %.1f us, Max late: %.1f us\n",
+                   on_time_pct,
+                   (unsigned long long)packets_late,
+                   avg_lateness_us,
+                   max_lateness_ns / 1000.0);
+        }
+
+        if (timing_stats && buffer_refills > 0) {
+            printf("[Buffer] Refills: %llu, Rate: %.1f MSPS\n",
+                   (unsigned long long)buffer_refills,
+                   g_rate_ctrl.sample_rate_hz / 1e6);
+        }
 
         /* Detailed subscriber statistics */
         printf("\n[Subscribers] Active: %d/%d\n", g_subscriber_count, MAX_SUBSCRIBERS);
