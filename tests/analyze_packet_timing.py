@@ -2,8 +2,12 @@
 """
 VITA49 Packet Timing Analyzer
 
-Captures packets and analyzes timing characteristics to verify rate control.
-Useful for diagnosing pacing issues and measuring jitter.
+Captures packets and analyzes timing characteristics.
+With the FIFO buffer architecture, packets arrive in bursts rather than
+at steady intervals. This tool helps diagnose:
+- Packet drops (sample loss)
+- Burst patterns
+- Overall throughput
 
 Usage:
     # Capture and analyze packets for 10 seconds

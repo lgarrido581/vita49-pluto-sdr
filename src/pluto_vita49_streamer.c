@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
@@ -56,10 +57,9 @@
 #define MAX_BUFFER_SAMPLES          65536       /* Maximum for memory/latency */
 #define BUFFER_TIME_TOLERANCE       0.1         /* 10% tolerance on timing */
 
-/* Rate Control Pacing Modes */
-#define PACING_MODE_STRICT          0           /* Always wait for correct send time */
-#define PACING_MODE_RELAXED         1           /* Send immediately if within 10% */
-#define PACING_MODE_NONE            2           /* Disable rate control (legacy) */
+/* Ring Buffer Configuration (Producer-Consumer FIFO) */
+#define RING_BUFFER_SLOTS           16          /* Number of buffer slots */
+#define RING_BUFFER_SLOT_SAMPLES    65536       /* Max samples per slot */
 
 /* MTU and Packet Size Configuration */
 #define MTU_STANDARD            1500            /* Standard Ethernet */
@@ -138,39 +138,46 @@ typedef struct {
     uint64_t timestamp_jumps;
     uint64_t last_timestamp_us;
 
-    /* Performance metrics */
-    uint64_t min_loop_time_us;
-    uint64_t max_loop_time_us;
+    /* Performance metrics (refill thread timing) */
     uint64_t total_loop_time_us;
     uint64_t loop_iterations;
 
-    /* Rate control metrics */
-    uint64_t packets_on_time;       /* Packets sent at or before target time */
-    uint64_t packets_late;          /* Packets sent after target time */
-    uint64_t total_lateness_ns;     /* Cumulative lateness for averaging */
-    uint64_t max_lateness_ns;       /* Worst-case lateness */
-    uint64_t total_early_ns;        /* Cumulative early time (for pacing efficiency) */
-
-    /* Buffer metrics */
-    uint64_t buffer_refills;        /* Total buffer refills */
-    uint64_t buffer_overruns;       /* Times refill completed before send finished */
+    /* FIFO buffer metrics */
+    uint64_t buffer_refills;        /* Total buffer refills from IIO */
+    uint64_t buffer_overruns;       /* Times ring buffer was full (samples lost) */
 
     pthread_mutex_t mutex;
 } stream_statistics_t;
 
 static stream_statistics_t g_stats = {0};
 
-/* Rate Controller */
+/*
+ * Lock-free single-producer single-consumer ring buffer
+ * Producer: refill thread (grabs samples from IIO)
+ * Consumer: send thread (sends UDP packets)
+ */
 typedef struct {
-    uint32_t sample_rate_hz;        /* Current sample rate */
-    size_t samples_per_packet;      /* Samples in each VITA49 packet */
-    uint64_t packet_interval_ns;    /* Nanoseconds between packet sends */
-    uint64_t buffer_start_ns;       /* Timestamp when buffer refill completed */
-    uint64_t samples_sent;          /* Running count for timing calculation */
-    int pacing_mode;                /* PACING_MODE_STRICT, RELAXED, or NONE */
-} rate_controller_t;
+    int16_t *data;              /* Sample data (I/Q interleaved) */
+    size_t num_samples;         /* Number of I/Q pairs */
+    uint64_t timestamp_ns;      /* Timestamp when buffer was acquired */
+    uint32_t sequence;          /* Sequence number for tracking */
+} ring_slot_t;
 
-static rate_controller_t g_rate_ctrl = {0};
+typedef struct {
+    ring_slot_t slots[RING_BUFFER_SLOTS];
+    size_t slot_capacity;       /* Max samples per slot */
+
+    /* Atomic indices for lock-free operation */
+    _Atomic size_t write_idx;   /* Next slot to write (producer) */
+    _Atomic size_t read_idx;    /* Next slot to read (consumer) */
+
+    /* Statistics */
+    _Atomic uint64_t overflows;     /* Producer couldn't write (buffer full) */
+    _Atomic uint64_t underflows;    /* Consumer couldn't read (buffer empty) */
+    _Atomic uint64_t total_samples; /* Total samples passed through */
+} ring_buffer_t;
+
+static ring_buffer_t g_ring = {0};
 
 /* VITA49 Packet Structures */
 #pragma pack(push, 1)
@@ -202,13 +209,22 @@ static uint64_t get_timestamp_us(void);
 static uint64_t get_timestamp_ns(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
 static size_t calculate_buffer_size(uint32_t sample_rate_hz);
-static void rate_controller_init(uint32_t sample_rate_hz, size_t samples_per_packet, int pacing_mode);
-static void rate_controller_start_buffer(void);
-static uint64_t rate_controller_wait_for_packet(size_t packet_index);
+
+/* Ring buffer functions */
+static int ring_buffer_init(size_t slot_capacity);
+static void ring_buffer_destroy(void);
+static size_t ring_buffer_write_available(void);
+static size_t ring_buffer_read_available(void);
+static int ring_buffer_write(const int16_t *samples, size_t num_samples, uint64_t timestamp_ns, uint32_t sequence);
+static int ring_buffer_read(ring_slot_t **slot_out);
+static void ring_buffer_read_done(void);
+static void ring_buffer_get_stats(uint64_t *overflows, uint64_t *underflows, uint64_t *total_samples, size_t *fill_level);
+
 static void encode_context_packet(uint8_t *buf, size_t *len);
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count);
 static void *control_thread(void *arg);
-static void *streaming_thread(void *arg);
+static void *refill_thread(void *arg);  /* Producer: grabs samples from IIO */
+static void *send_thread(void *arg);    /* Consumer: sends UDP packets */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
 
 /* Utility functions */
@@ -266,116 +282,152 @@ static size_t calculate_buffer_size(uint32_t sample_rate_hz) {
 }
 
 /**
- * Initialize rate controller for current configuration
- * Call after sample rate changes and before streaming loop
+ * Initialize ring buffer
+ * @param slot_capacity  Maximum samples per slot (should match IIO buffer size)
+ * @return 0 on success, -1 on failure
  */
-static void rate_controller_init(uint32_t sample_rate_hz, size_t samples_per_packet, int pacing_mode) {
-    g_rate_ctrl.sample_rate_hz = sample_rate_hz;
-    g_rate_ctrl.samples_per_packet = samples_per_packet;
-    g_rate_ctrl.pacing_mode = pacing_mode;
+static int ring_buffer_init(size_t slot_capacity) {
+    g_ring.slot_capacity = slot_capacity;
+    atomic_store(&g_ring.write_idx, 0);
+    atomic_store(&g_ring.read_idx, 0);
+    atomic_store(&g_ring.overflows, 0);
+    atomic_store(&g_ring.underflows, 0);
+    atomic_store(&g_ring.total_samples, 0);
 
-    /* Calculate interval between packets in nanoseconds
-     * interval_ns = (samples_per_packet / sample_rate_hz) * 1e9
-     * Use integer math to avoid floating point:
-     * interval_ns = samples_per_packet * 1,000,000,000 / sample_rate_hz
-     */
-    g_rate_ctrl.packet_interval_ns =
-        (uint64_t)samples_per_packet * 1000000000ULL / sample_rate_hz;
-
-    g_rate_ctrl.samples_sent = 0;
-    g_rate_ctrl.buffer_start_ns = 0;
-
-    const char *mode_str = "unknown";
-    switch (pacing_mode) {
-        case PACING_MODE_STRICT: mode_str = "strict"; break;
-        case PACING_MODE_RELAXED: mode_str = "relaxed"; break;
-        case PACING_MODE_NONE: mode_str = "none"; break;
-    }
-
-    printf("[RateCtrl] Initialized: %u Hz, %zu samples/pkt, %llu ns interval, mode=%s\n",
-           sample_rate_hz, samples_per_packet,
-           (unsigned long long)g_rate_ctrl.packet_interval_ns, mode_str);
-}
-
-/**
- * Mark the start of a new buffer's transmission window
- * Call immediately after iio_buffer_refill() returns
- */
-static void rate_controller_start_buffer(void) {
-    g_rate_ctrl.buffer_start_ns = get_timestamp_ns();
-    g_rate_ctrl.samples_sent = 0;
-
-    pthread_mutex_lock(&g_stats.mutex);
-    g_stats.buffer_refills++;
-    pthread_mutex_unlock(&g_stats.mutex);
-}
-
-/**
- * Wait until it's time to send the next packet
- * Returns the target send time for timestamp calculation
- *
- * @param packet_index  Which packet in the current buffer (0-based)
- * @return Target timestamp in nanoseconds, or 0 if we're behind schedule
- */
-static uint64_t rate_controller_wait_for_packet(size_t packet_index) {
-    /* Skip pacing if disabled */
-    if (g_rate_ctrl.pacing_mode == PACING_MODE_NONE) {
-        return get_timestamp_ns();
-    }
-
-    /* Calculate when this packet should be sent */
-    uint64_t target_ns = g_rate_ctrl.buffer_start_ns +
-                         (packet_index * g_rate_ctrl.packet_interval_ns);
-
-    /* Get current time */
-    uint64_t now_ns = get_timestamp_ns();
-
-    if (now_ns < target_ns) {
-        /* We're ahead of schedule */
-        uint64_t sleep_ns = target_ns - now_ns;
-
-        /* Track early time for statistics */
-        pthread_mutex_lock(&g_stats.mutex);
-        g_stats.total_early_ns += sleep_ns;
-        g_stats.packets_on_time++;
-        pthread_mutex_unlock(&g_stats.mutex);
-
-        /* In relaxed mode, only sleep if more than 10% early */
-        if (g_rate_ctrl.pacing_mode == PACING_MODE_RELAXED) {
-            uint64_t tolerance_ns = g_rate_ctrl.packet_interval_ns / 10;
-            if (sleep_ns <= tolerance_ns) {
-                return target_ns;  /* Close enough, send now */
+    /* Allocate data buffers for each slot */
+    for (int i = 0; i < RING_BUFFER_SLOTS; i++) {
+        /* 4 bytes per sample: 2 bytes I + 2 bytes Q */
+        g_ring.slots[i].data = (int16_t *)malloc(slot_capacity * 4);
+        if (!g_ring.slots[i].data) {
+            /* Cleanup on failure */
+            for (int j = 0; j < i; j++) {
+                free(g_ring.slots[j].data);
             }
+            return -1;
         }
-
-        /* Only sleep if it's worth it (> 1 microsecond) */
-        if (sleep_ns > 1000) {
-            struct timespec sleep_ts;
-            sleep_ts.tv_sec = sleep_ns / 1000000000ULL;
-            sleep_ts.tv_nsec = sleep_ns % 1000000000ULL;
-            nanosleep(&sleep_ts, NULL);
-        }
-
-        return target_ns;
-    } else {
-        /* We're behind schedule - send immediately, track the slip */
-        uint64_t slip_ns = now_ns - target_ns;
-
-        pthread_mutex_lock(&g_stats.mutex);
-        g_stats.packets_late++;
-        g_stats.total_lateness_ns += slip_ns;
-        if (slip_ns > g_stats.max_lateness_ns) {
-            g_stats.max_lateness_ns = slip_ns;
-        }
-
-        /* If we've slipped by more than one packet interval, it's a significant underflow */
-        if (slip_ns > g_rate_ctrl.packet_interval_ns) {
-            g_stats.underflows++;
-        }
-        pthread_mutex_unlock(&g_stats.mutex);
-
-        return 0;  /* Indicates we're behind */
+        g_ring.slots[i].num_samples = 0;
+        g_ring.slots[i].timestamp_ns = 0;
+        g_ring.slots[i].sequence = 0;
     }
+
+    printf("[RingBuffer] Initialized: %d slots x %zu samples = %zu MB\n",
+           RING_BUFFER_SLOTS, slot_capacity,
+           (RING_BUFFER_SLOTS * slot_capacity * 4) / (1024 * 1024));
+
+    return 0;
+}
+
+/**
+ * Destroy ring buffer and free memory
+ */
+static void ring_buffer_destroy(void) {
+    for (int i = 0; i < RING_BUFFER_SLOTS; i++) {
+        if (g_ring.slots[i].data) {
+            free(g_ring.slots[i].data);
+            g_ring.slots[i].data = NULL;
+        }
+    }
+}
+
+/**
+ * Get number of slots available for writing
+ */
+static size_t ring_buffer_write_available(void) {
+    size_t w = atomic_load(&g_ring.write_idx);
+    size_t r = atomic_load(&g_ring.read_idx);
+
+    /* Leave one slot empty to distinguish full from empty */
+    size_t used = (w >= r) ? (w - r) : (RING_BUFFER_SLOTS - r + w);
+    return RING_BUFFER_SLOTS - 1 - used;
+}
+
+/**
+ * Get number of slots available for reading
+ */
+static size_t ring_buffer_read_available(void) {
+    size_t w = atomic_load(&g_ring.write_idx);
+    size_t r = atomic_load(&g_ring.read_idx);
+    return (w >= r) ? (w - r) : (RING_BUFFER_SLOTS - r + w);
+}
+
+/**
+ * Write samples to ring buffer (called by refill thread)
+ *
+ * @param samples       Pointer to I/Q sample data
+ * @param num_samples   Number of I/Q pairs
+ * @param timestamp_ns  Acquisition timestamp
+ * @param sequence      Sequence number
+ * @return 0 on success, -1 if buffer full (overflow)
+ */
+static int ring_buffer_write(const int16_t *samples, size_t num_samples,
+                             uint64_t timestamp_ns, uint32_t sequence) {
+    if (ring_buffer_write_available() == 0) {
+        atomic_fetch_add(&g_ring.overflows, 1);
+        return -1;  /* Buffer full - overflow */
+    }
+
+    size_t idx = atomic_load(&g_ring.write_idx);
+    ring_slot_t *slot = &g_ring.slots[idx];
+
+    /* Copy data */
+    size_t copy_samples = (num_samples > g_ring.slot_capacity) ?
+                          g_ring.slot_capacity : num_samples;
+    memcpy(slot->data, samples, copy_samples * 4);
+    slot->num_samples = copy_samples;
+    slot->timestamp_ns = timestamp_ns;
+    slot->sequence = sequence;
+
+    /* Memory barrier before updating index */
+    atomic_thread_fence(memory_order_release);
+
+    /* Advance write index */
+    atomic_store(&g_ring.write_idx, (idx + 1) % RING_BUFFER_SLOTS);
+
+    atomic_fetch_add(&g_ring.total_samples, copy_samples);
+
+    return 0;
+}
+
+/**
+ * Read samples from ring buffer (called by send thread)
+ *
+ * @param slot_out  Pointer to receive slot data (do not free!)
+ * @return 0 on success, -1 if buffer empty (underflow)
+ */
+static int ring_buffer_read(ring_slot_t **slot_out) {
+    if (ring_buffer_read_available() == 0) {
+        atomic_fetch_add(&g_ring.underflows, 1);
+        return -1;  /* Buffer empty - underflow */
+    }
+
+    size_t idx = atomic_load(&g_ring.read_idx);
+
+    /* Memory barrier before reading data */
+    atomic_thread_fence(memory_order_acquire);
+
+    *slot_out = &g_ring.slots[idx];
+
+    return 0;
+}
+
+/**
+ * Mark current read slot as consumed (advance read pointer)
+ * Call after processing data from ring_buffer_read()
+ */
+static void ring_buffer_read_done(void) {
+    size_t idx = atomic_load(&g_ring.read_idx);
+    atomic_store(&g_ring.read_idx, (idx + 1) % RING_BUFFER_SLOTS);
+}
+
+/**
+ * Get ring buffer statistics
+ */
+static void ring_buffer_get_stats(uint64_t *overflows, uint64_t *underflows,
+                                  uint64_t *total_samples, size_t *fill_level) {
+    *overflows = atomic_load(&g_ring.overflows);
+    *underflows = atomic_load(&g_ring.underflows);
+    *total_samples = atomic_load(&g_ring.total_samples);
+    *fill_level = ring_buffer_read_available();
 }
 
 /* Calculate optimal samples per packet to fit within MTU */
@@ -882,13 +934,19 @@ static void *control_thread(void *arg) {
     return NULL;
 }
 
-/* Streaming thread - sends IQ data with rate control */
-static void *streaming_thread(void *arg) {
+/**
+ * Refill thread (Producer) - Grabs samples from IIO as fast as possible
+ *
+ * This thread NEVER sleeps (except when blocked on iio_buffer_refill).
+ * It writes samples to the ring buffer immediately after receiving them.
+ * The DMA buffer must be read before the AD9361 overwrites it.
+ */
+static void *refill_thread(void *arg) {
     struct iio_context *ctx = (struct iio_context *)arg;
     struct iio_device *dev = iio_context_find_device(ctx, "cf-ad9361-lpc");
 
     if (!dev) {
-        fprintf(stderr, "[Streaming] ERROR: Device not found\n");
+        fprintf(stderr, "[Refill] ERROR: Device not found\n");
         return NULL;
     }
 
@@ -905,44 +963,24 @@ static void *streaming_thread(void *arg) {
     size_t buffer_samples = calculate_buffer_size(current_rate);
     struct iio_buffer *rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
     if (!rxbuf) {
-        fprintf(stderr, "[Streaming] ERROR: Failed to create buffer\n");
+        fprintf(stderr, "[Refill] ERROR: Failed to create buffer\n");
         return NULL;
     }
 
-    printf("[Streaming] Created buffer: %zu samples (%.2f ms at %.1f MSPS)\n",
+    printf("[Refill] Created IIO buffer: %zu samples (%.2f ms at %.1f MSPS)\n",
            buffer_samples,
            (double)buffer_samples * 1000.0 / current_rate,
            current_rate / 1e6);
 
-    /* Initialize rate controller */
-    rate_controller_init(current_rate, g_samples_per_packet, g_rate_ctrl.pacing_mode);
-
-    /* Create UDP socket for data */
-    int data_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (data_sock < 0) {
-        fprintf(stderr, "[Streaming] ERROR: Failed to create socket\n");
-        iio_buffer_destroy(rxbuf);
-        return NULL;
-    }
-
-    printf("[Streaming] Started - rate-controlled mode\n");
-
-    uint8_t packet_count = 0;
-    int packets_since_context = 0;
-    uint64_t packets_sent = 0;
-    static uint8_t packet_buf[MAX_PACKET_BUFFER];  /* Static to avoid stack overflow with large buffer */
-    size_t packet_len;
+    uint32_t sequence = 0;
     uint64_t last_config_check_us = get_timestamp_us();
 
-    while (g_running) {
-        /* Periodic cleanup of dead subscribers */
-        if (packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0 && packets_sent > 0) {
-            cleanup_dead_subscribers();
-        }
+    printf("[Refill] Started - producer thread running\n");
 
+    while (g_running) {
         /* Check for configuration changes every 100ms */
         uint64_t now_us = get_timestamp_us();
-        if (now_us - last_config_check_us >= 100000) {  /* 100ms = 100,000 microseconds */
+        if (now_us - last_config_check_us >= 100000) {
             last_config_check_us = now_us;
 
             pthread_mutex_lock(&g_sdr_config.mutex);
@@ -950,8 +988,8 @@ static void *streaming_thread(void *arg) {
             pthread_mutex_unlock(&g_sdr_config.mutex);
 
             if (needs_reconfig) {
-                printf("[Streaming] ========================================\n");
-                printf("[Streaming] Configuration change detected - applying to hardware\n");
+                printf("[Refill] ========================================\n");
+                printf("[Refill] Configuration change detected - applying to hardware\n");
 
                 /* Destroy current buffer */
                 iio_buffer_destroy(rxbuf);
@@ -964,13 +1002,12 @@ static void *streaming_thread(void *arg) {
 
                 /* Apply new configuration to SDR hardware */
                 if (configure_sdr(ctx, dev) < 0) {
-                    fprintf(stderr, "[Streaming] ERROR: Failed to apply new configuration\n");
-                    fprintf(stderr, "[Streaming] ERROR: Keeping old configuration\n");
+                    fprintf(stderr, "[Refill] ERROR: Failed to apply new configuration\n");
 
                     /* Try to recreate buffer with old settings */
                     rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
                     if (!rxbuf) {
-                        fprintf(stderr, "[Streaming] FATAL: Cannot recreate buffer - stopping\n");
+                        fprintf(stderr, "[Refill] FATAL: Cannot recreate buffer - stopping\n");
                         break;
                     }
 
@@ -984,12 +1021,10 @@ static void *streaming_thread(void *arg) {
                 buffer_samples = calculate_buffer_size(new_rate);
                 rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
                 if (!rxbuf) {
-                    fprintf(stderr, "[Streaming] FATAL: Failed to recreate buffer - stopping\n");
+                    fprintf(stderr, "[Refill] FATAL: Failed to recreate buffer - stopping\n");
                     break;
                 }
 
-                /* Reinitialize rate controller for new sample rate */
-                rate_controller_init(new_rate, g_samples_per_packet, g_rate_ctrl.pacing_mode);
                 current_rate = new_rate;
 
                 /* Clear the flag */
@@ -997,44 +1032,32 @@ static void *streaming_thread(void *arg) {
                 g_sdr_config.config_changed = false;
                 pthread_mutex_unlock(&g_sdr_config.mutex);
 
-                /* Send Context packet to notify all subscribers of the change */
-                encode_context_packet(packet_buf, &packet_len);
-                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
-                pthread_mutex_lock(&g_stats.mutex);
-                g_stats.contexts_sent++;
-                pthread_mutex_unlock(&g_stats.mutex);
-
-                printf("[Streaming] Buffer resized: %zu samples (%.2f ms at %.1f MSPS)\n",
+                printf("[Refill] Buffer resized: %zu samples (%.2f ms at %.1f MSPS)\n",
                        buffer_samples,
                        (double)buffer_samples * 1000.0 / new_rate,
                        new_rate / 1e6);
-                printf("[Streaming] Configuration applied successfully\n");
-                printf("[Streaming] Notified %d subscribers of config change\n", g_subscriber_count);
-                printf("[Streaming] ========================================\n");
+                printf("[Refill] Configuration applied successfully\n");
+                printf("[Refill] ========================================\n");
 
-                packets_since_context = 0;  /* Reset counter */
+                pthread_mutex_lock(&g_stats.mutex);
+                g_stats.reconfigs++;
+                pthread_mutex_unlock(&g_stats.mutex);
             }
         }
 
-        /* Refill buffer with improved error handling */
-        uint64_t loop_start = get_timestamp_us();
+        /* Refill buffer - BLOCKS until DMA delivers data */
+        uint64_t refill_start = get_timestamp_ns();
         ssize_t nbytes = iio_buffer_refill(rxbuf);
+
         if (nbytes < 0) {
             pthread_mutex_lock(&g_stats.mutex);
             g_stats.refill_failures++;
-            uint64_t failures = g_stats.refill_failures;
             pthread_mutex_unlock(&g_stats.mutex);
-
-            fprintf(stderr, "[Streaming] ERROR: Buffer refill failed (total failures: %llu)\n",
-                    (unsigned long long)failures);
-
-            /* Attempt recovery instead of breaking */
-            usleep(1000);  /* 1ms delay */
+            usleep(1000);  /* Brief delay before retry */
             continue;
         }
 
-        /* Mark buffer start time for rate control */
-        rate_controller_start_buffer();
+        uint64_t timestamp_ns = get_timestamp_ns();
 
         /* Get pointer to data */
         int16_t *samples = (int16_t *)iio_buffer_first(rxbuf, iio_device_get_channel(dev, 0));
@@ -1042,45 +1065,118 @@ static void *streaming_thread(void *arg) {
 
         size_t num_samples = nbytes / (2 * sizeof(int16_t));  /* IQ pairs */
 
-        /* Timestamp discontinuity detection */
-        uint64_t current_ts = get_timestamp_us();
+        /* Write to ring buffer - MUST NOT BLOCK */
+        int ret = ring_buffer_write(samples, num_samples, timestamp_ns, sequence++);
+
+        if (ret < 0) {
+            /* Ring buffer full - send thread can't keep up */
+            pthread_mutex_lock(&g_stats.mutex);
+            g_stats.buffer_overruns++;
+            pthread_mutex_unlock(&g_stats.mutex);
+
+            /* Log only occasionally to avoid flooding */
+            static uint64_t last_overflow_log = 0;
+            if (timestamp_ns - last_overflow_log > 1000000000ULL) {  /* 1 second */
+                fprintf(stderr, "[Refill] WARNING: Ring buffer overflow - send thread too slow\n");
+                last_overflow_log = timestamp_ns;
+            }
+        }
 
         pthread_mutex_lock(&g_stats.mutex);
-        if (g_stats.last_timestamp_us != 0) {
-            /* Calculate expected time delta based on sample count */
-            uint32_t sample_rate;
+        g_stats.buffer_refills++;
+        pthread_mutex_unlock(&g_stats.mutex);
+
+        /* Timing statistics */
+        uint64_t refill_time = get_timestamp_ns() - refill_start;
+        pthread_mutex_lock(&g_stats.mutex);
+        g_stats.total_loop_time_us += refill_time / 1000;
+        g_stats.loop_iterations++;
+        pthread_mutex_unlock(&g_stats.mutex);
+    }
+
+    printf("[Refill] Stopped\n");
+    iio_buffer_destroy(rxbuf);
+    return NULL;
+}
+
+/**
+ * Send thread (Consumer) - Sends UDP packets as fast as network allows
+ *
+ * This thread reads from the ring buffer and sends packets immediately.
+ * No artificial pacing - the network is the only rate limiter.
+ * Small usleep(100) when buffer empty to avoid busy-waiting.
+ */
+static void *send_thread(void *arg) {
+    (void)arg;  /* Unused - we use global ring buffer */
+
+    /* Create UDP socket for data */
+    int data_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (data_sock < 0) {
+        fprintf(stderr, "[Send] ERROR: Failed to create socket\n");
+        return NULL;
+    }
+
+    /* Increase socket send buffer for burst handling */
+    int sndbuf = 4 * 1024 * 1024;  /* 4 MB */
+    setsockopt(data_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    printf("[Send] Started - consumer thread running\n");
+
+    static uint8_t packet_buf[MAX_PACKET_BUFFER];
+    size_t packet_len;
+    uint8_t packet_count = 0;
+    int packets_since_context = 0;
+    uint64_t packets_sent = 0;
+    uint64_t last_timestamp_ns = 0;
+
+    while (g_running) {
+        /* Try to read from ring buffer */
+        ring_slot_t *slot = NULL;
+        int ret = ring_buffer_read(&slot);
+
+        if (ret < 0) {
+            /* Buffer empty - small sleep to avoid busy-wait */
+            usleep(100);  /* 100 microseconds */
+            continue;
+        }
+
+        /* We have data - send it as fast as possible */
+        int16_t *samples = slot->data;
+        size_t num_samples = slot->num_samples;
+        uint64_t buffer_timestamp = slot->timestamp_ns;
+
+        /* Timestamp discontinuity detection */
+        if (last_timestamp_ns != 0) {
             pthread_mutex_lock(&g_sdr_config.mutex);
-            sample_rate = g_sdr_config.sample_rate_hz;
+            uint32_t sample_rate = g_sdr_config.sample_rate_hz;
             pthread_mutex_unlock(&g_sdr_config.mutex);
 
-            uint64_t expected_delta_us = (num_samples * 1000000ULL) / sample_rate;
-            uint64_t actual_delta_us = current_ts - g_stats.last_timestamp_us;
-            int64_t delta_error = (int64_t)(actual_delta_us - expected_delta_us);
+            uint64_t expected_delta_ns = (num_samples * 1000000000ULL) / sample_rate;
+            uint64_t actual_delta_ns = buffer_timestamp - last_timestamp_ns;
+            int64_t delta_error = (int64_t)(actual_delta_ns - expected_delta_ns);
 
-            if (llabs(delta_error) > 10000) {  /* More than 10ms discrepancy */
+            if (llabs(delta_error) > 10000000) {  /* More than 10ms discrepancy */
+                pthread_mutex_lock(&g_stats.mutex);
                 g_stats.timestamp_jumps++;
-                fprintf(stderr, "[Streaming] WARNING: Timestamp jump detected: %lld us\n",
-                        (long long)delta_error);
-
                 if (delta_error > 0) {
-                    g_stats.underflows++;  /* Samples arrived late */
-                    fprintf(stderr, "[Streaming] WARNING: Possible UNDERFLOW detected\n");
+                    g_stats.underflows++;
                 } else {
-                    g_stats.overflows++;   /* Samples arrived early (shouldn't happen) */
-                    fprintf(stderr, "[Streaming] WARNING: Possible OVERFLOW detected\n");
+                    g_stats.overflows++;
+                }
+                pthread_mutex_unlock(&g_stats.mutex);
+
+                static uint64_t last_jump_log = 0;
+                if (buffer_timestamp - last_jump_log > 1000000000ULL) {
+                    fprintf(stderr, "[Send] WARNING: Timestamp jump: %lld ms\n",
+                            (long long)(delta_error / 1000000));
+                    last_jump_log = buffer_timestamp;
                 }
             }
         }
-        g_stats.last_timestamp_us = current_ts;
-        pthread_mutex_unlock(&g_stats.mutex);
+        last_timestamp_ns = buffer_timestamp;
 
-        /* Rate-Controlled Packet Transmission */
-        size_t packet_index = 0;
+        /* Send all packets from this buffer */
         for (size_t offset = 0; offset < num_samples; offset += g_samples_per_packet) {
-            /* Wait for correct send time (rate control) */
-            rate_controller_wait_for_packet(packet_index);
-
-            /* Check if we should stop */
             if (!g_running) break;
 
             size_t chunk_size = (offset + g_samples_per_packet > num_samples) ?
@@ -1105,29 +1201,22 @@ static void *streaming_thread(void *arg) {
             g_stats.packets_sent++;
             g_stats.bytes_sent += packet_len;
             pthread_mutex_unlock(&g_stats.mutex);
+
             packets_since_context++;
             packets_sent++;
-            packet_index++;
         }
 
-        /* Loop timing measurements */
-        uint64_t loop_time = get_timestamp_us() - loop_start;
-        pthread_mutex_lock(&g_stats.mutex);
-        if (loop_time < g_stats.min_loop_time_us || g_stats.min_loop_time_us == 0) {
-            g_stats.min_loop_time_us = loop_time;
+        /* Mark slot as consumed - MUST be done after processing */
+        ring_buffer_read_done();
+
+        /* Periodic cleanup of dead subscribers */
+        if (packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0) {
+            cleanup_dead_subscribers();
         }
-        if (loop_time > g_stats.max_loop_time_us) {
-            g_stats.max_loop_time_us = loop_time;
-        }
-        g_stats.total_loop_time_us += loop_time;
-        g_stats.loop_iterations++;
-        pthread_mutex_unlock(&g_stats.mutex);
     }
 
-    printf("[Streaming] Stopped\n");
-
+    printf("[Send] Stopped\n");
     close(data_sock);
-    iio_buffer_destroy(rxbuf);
     return NULL;
 }
 
@@ -1187,8 +1276,6 @@ int main(int argc, char **argv) {
     /* Parse command-line arguments */
     size_t mtu = MTU_STANDARD;  /* Default to standard Ethernet */
     bool use_jumbo = false;
-    int pacing_mode = PACING_MODE_STRICT;  /* Default to strict pacing */
-    bool timing_stats = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--jumbo") == 0) {
@@ -1196,43 +1283,25 @@ int main(int argc, char **argv) {
             mtu = MTU_JUMBO;
         } else if (strcmp(argv[i], "--mtu") == 0 && i + 1 < argc) {
             mtu = (size_t)atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--pacing-mode") == 0 && i + 1 < argc) {
-            i++;
-            if (strcmp(argv[i], "strict") == 0) {
-                pacing_mode = PACING_MODE_STRICT;
-            } else if (strcmp(argv[i], "relaxed") == 0) {
-                pacing_mode = PACING_MODE_RELAXED;
-            } else if (strcmp(argv[i], "none") == 0) {
-                pacing_mode = PACING_MODE_NONE;
-            } else {
-                fprintf(stderr, "ERROR: Unknown pacing mode '%s'\n", argv[i]);
-                fprintf(stderr, "Valid modes: strict, relaxed, none\n");
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--timing-stats") == 0) {
-            timing_stats = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
             printf("  --jumbo               Use jumbo frames (MTU 9000)\n");
             printf("  --mtu <size>          Set custom MTU size in bytes\n");
-            printf("  --pacing-mode <mode>  Pacing mode: strict|relaxed|none (default: strict)\n");
-            printf("                        strict:  Always wait for correct send time\n");
-            printf("                        relaxed: Send immediately if within 10%% of target\n");
-            printf("                        none:    Disable rate control (legacy mode)\n");
-            printf("  --timing-stats        Enable detailed timing statistics\n");
             printf("  --help, -h            Show this help message\n");
             printf("\nExamples:\n");
-            printf("  %s                    # Standard MTU, strict pacing\n", argv[0]);
+            printf("  %s                    # Standard MTU (1500 bytes)\n", argv[0]);
             printf("  %s --jumbo            # Jumbo frames (9000 bytes)\n", argv[0]);
             printf("  %s --mtu 1492         # PPPoE MTU\n", argv[0]);
-            printf("  %s --pacing-mode none # Disable rate control\n", argv[0]);
+            printf("\nArchitecture:\n");
+            printf("  This streamer uses a producer-consumer FIFO model:\n");
+            printf("  - Refill thread: Grabs samples from IIO DMA as fast as possible\n");
+            printf("  - Ring buffer:   %d slots x %d samples (lock-free SPSC)\n",
+                   RING_BUFFER_SLOTS, RING_BUFFER_SLOT_SAMPLES);
+            printf("  - Send thread:   Sends UDP packets as fast as network allows\n");
             return 0;
         }
     }
-
-    /* Initialize rate controller pacing mode */
-    g_rate_ctrl.pacing_mode = pacing_mode;
 
     /* Calculate optimal packet size based on MTU */
     g_samples_per_packet = calculate_optimal_samples_per_packet(mtu);
@@ -1242,24 +1311,16 @@ int main(int argc, char **argv) {
     size_t total_vita49_packet = packet_payload + VITA49_OVERHEAD;
     size_t total_udp_datagram = total_vita49_packet + IP_UDP_OVERHEAD;
 
-    /* Determine pacing mode string */
-    const char *pacing_mode_str = "unknown";
-    switch (pacing_mode) {
-        case PACING_MODE_STRICT: pacing_mode_str = "strict"; break;
-        case PACING_MODE_RELAXED: pacing_mode_str = "relaxed"; break;
-        case PACING_MODE_NONE: pacing_mode_str = "none (legacy)"; break;
-    }
-
     printf("========================================\n");
     printf("VITA49 Standalone Streamer for Pluto\n");
-    printf("  Rate-Controlled Edition\n");
+    printf("  FIFO Buffer Edition (Producer-Consumer)\n");
     printf("========================================\n");
     printf("MTU: %zu bytes%s\n", mtu, use_jumbo ? " (Jumbo frames)" : "");
     printf("Samples per packet: %zu\n", g_samples_per_packet);
     printf("VITA49 packet size: %zu bytes\n", total_vita49_packet);
     printf("UDP datagram size: %zu bytes\n", total_udp_datagram);
-    printf("Pacing mode: %s\n", pacing_mode_str);
-    printf("Timing stats: %s\n", timing_stats ? "enabled" : "disabled");
+    printf("Ring buffer: %d slots x %d samples\n",
+           RING_BUFFER_SLOTS, RING_BUFFER_SLOT_SAMPLES);
 
     if (total_udp_datagram > mtu) {
         fprintf(stderr, "WARNING: Packet size exceeds MTU! Will fragment.\n");
@@ -1276,6 +1337,12 @@ int main(int argc, char **argv) {
     /* Initialize statistics mutex */
     pthread_mutex_init(&g_stats.mutex, NULL);
 
+    /* Initialize ring buffer */
+    if (ring_buffer_init(RING_BUFFER_SLOT_SAMPLES) < 0) {
+        fprintf(stderr, "ERROR: Failed to initialize ring buffer\n");
+        return 1;
+    }
+
     /* Create IIO context */
     struct iio_context *ctx = iio_create_local_context();
     if (!ctx) {
@@ -1284,6 +1351,7 @@ int main(int argc, char **argv) {
 
     if (!ctx) {
         fprintf(stderr, "ERROR: Failed to create IIO context\n");
+        ring_buffer_destroy();
         return 1;
     }
 
@@ -1294,6 +1362,7 @@ int main(int argc, char **argv) {
     if (control_sock < 0) {
         fprintf(stderr, "ERROR: Failed to create control socket\n");
         iio_context_destroy(ctx);
+        ring_buffer_destroy();
         return 1;
     }
 
@@ -1306,22 +1375,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: Failed to bind control socket\n");
         close(control_sock);
         iio_context_destroy(ctx);
+        ring_buffer_destroy();
         return 1;
     }
 
     printf("Control port: %d\n", CONTROL_PORT);
     printf("Data port: %d\n\n", DATA_PORT);
 
-    /* Start threads */
-    pthread_t control_tid, streaming_tid;
+    /* Start 3 threads: control, refill (producer), send (consumer) */
+    pthread_t control_tid, refill_tid, send_tid;
 
     pthread_create(&control_tid, NULL, control_thread, &control_sock);
-    pthread_create(&streaming_tid, NULL, streaming_thread, ctx);
+    pthread_create(&refill_tid, NULL, refill_thread, ctx);
+    pthread_create(&send_tid, NULL, send_thread, NULL);
 
-    /* Monitor */
+    /* Monitor loop */
     while (g_running) {
         sleep(5);
 
+        /* Get statistics */
         pthread_mutex_lock(&g_stats.mutex);
         uint64_t packets = g_stats.packets_sent;
         uint64_t bytes = g_stats.bytes_sent;
@@ -1330,18 +1402,17 @@ int main(int argc, char **argv) {
         uint64_t overflows = g_stats.overflows;
         uint64_t refill_fails = g_stats.refill_failures;
         uint64_t ts_jumps = g_stats.timestamp_jumps;
-        uint64_t min_loop = g_stats.min_loop_time_us;
-        uint64_t max_loop = g_stats.max_loop_time_us;
+        uint64_t buffer_refills = g_stats.buffer_refills;
+        uint64_t buffer_overruns = g_stats.buffer_overruns;
         double avg_loop = g_stats.loop_iterations > 0 ?
             (double)g_stats.total_loop_time_us / g_stats.loop_iterations : 0;
-
-        /* Rate control statistics */
-        uint64_t packets_on_time = g_stats.packets_on_time;
-        uint64_t packets_late = g_stats.packets_late;
-        uint64_t total_lateness_ns = g_stats.total_lateness_ns;
-        uint64_t max_lateness_ns = g_stats.max_lateness_ns;
-        uint64_t buffer_refills = g_stats.buffer_refills;
         pthread_mutex_unlock(&g_stats.mutex);
+
+        /* Ring buffer statistics */
+        uint64_t ring_overflows, ring_underflows, ring_total_samples;
+        size_t ring_fill;
+        ring_buffer_get_stats(&ring_overflows, &ring_underflows,
+                              &ring_total_samples, &ring_fill);
 
         printf("[Stats] Packets: %llu, Bytes: %llu MB, Contexts: %u, Subs: %d\n",
                (unsigned long long)packets,
@@ -1354,29 +1425,14 @@ int main(int argc, char **argv) {
                (unsigned long long)refill_fails,
                (unsigned long long)ts_jumps);
 
-        printf("[Timing] Loop: avg=%.1f us, min=%llu us, max=%llu us\n",
-               avg_loop,
-               (unsigned long long)min_loop,
-               (unsigned long long)max_loop);
+        printf("[FIFO] Fill: %zu/%d, Refills: %llu, Overruns: %llu, Ring OVF/UNF: %llu/%llu\n",
+               ring_fill, RING_BUFFER_SLOTS,
+               (unsigned long long)buffer_refills,
+               (unsigned long long)buffer_overruns,
+               (unsigned long long)ring_overflows,
+               (unsigned long long)ring_underflows);
 
-        /* Rate control statistics */
-        uint64_t total_paced = packets_on_time + packets_late;
-        if (total_paced > 0) {
-            double on_time_pct = 100.0 * packets_on_time / total_paced;
-            double avg_lateness_us = packets_late > 0 ?
-                (double)total_lateness_ns / packets_late / 1000.0 : 0;
-            printf("[RateCtrl] On-time: %.1f%%, Late: %llu, Avg late: %.1f us, Max late: %.1f us\n",
-                   on_time_pct,
-                   (unsigned long long)packets_late,
-                   avg_lateness_us,
-                   max_lateness_ns / 1000.0);
-        }
-
-        if (timing_stats && buffer_refills > 0) {
-            printf("[Buffer] Refills: %llu, Rate: %.1f MSPS\n",
-                   (unsigned long long)buffer_refills,
-                   g_rate_ctrl.sample_rate_hz / 1e6);
-        }
+        printf("[Timing] Avg refill: %.1f us\n", avg_loop);
 
         /* Detailed subscriber statistics */
         printf("\n[Subscribers] Active: %d/%d\n", g_subscriber_count, MAX_SUBSCRIBERS);
@@ -1404,10 +1460,12 @@ int main(int argc, char **argv) {
 
     /* Cleanup */
     pthread_join(control_tid, NULL);
-    pthread_join(streaming_tid, NULL);
+    pthread_join(refill_tid, NULL);
+    pthread_join(send_tid, NULL);
 
     close(control_sock);
     iio_context_destroy(ctx);
+    ring_buffer_destroy();
     pthread_mutex_destroy(&g_stats.mutex);
 
     printf("\n✓ Stopped\n");

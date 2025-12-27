@@ -3,18 +3,18 @@
 VITA49 Bandwidth Scaling Verification
 
 Tests that network bandwidth scales correctly with sample rate.
-This verifies that rate control is working - bandwidth should be
-proportional to sample rate, not constant at maximum.
+With the FIFO buffer architecture, bandwidth should be proportional
+to sample rate since samples flow through as fast as the network allows.
 
 Expected bandwidth formula:
     bandwidth_bps = sample_rate * 4 bytes/sample * 8 bits/byte
                   = sample_rate * 32
 
 Example:
-    5 MSPS  -> 160 Mbps (theoretical), ~40 Mbps with overhead
-    10 MSPS -> 320 Mbps (theoretical), ~80 Mbps with overhead
-    20 MSPS -> 640 Mbps (theoretical), ~160 Mbps with overhead
-    30 MSPS -> 960 Mbps (theoretical), ~240 Mbps with overhead
+    5 MSPS  -> 160 Mbps (theoretical), ~40-80 Mbps with overhead
+    10 MSPS -> 320 Mbps (theoretical), ~80-160 Mbps with overhead
+    20 MSPS -> 640 Mbps (theoretical), ~160-320 Mbps with overhead
+    30 MSPS -> 960 Mbps (theoretical), ~240-480 Mbps with overhead
 
 Usage:
     python verify_bandwidth_scaling.py --pluto 192.168.2.1

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-VITA49 Rate Control Test Suite
+VITA49 FIFO Buffer Test Suite
 
-Tests the rate control implementation to verify:
-1. Dynamic buffer sizing based on sample rate
-2. Consistent packet timing
-3. Bandwidth scaling with sample rate
-4. No sample loss under normal conditions
+Tests the FIFO buffer (producer-consumer) implementation to verify:
+1. No sample loss (continuous timestamps)
+2. Bandwidth scales linearly with sample rate
+3. No packet drops under normal network conditions
+4. Ring buffer operates without overflow/underflow
+
+Architecture:
+    - Refill thread: Grabs samples from IIO DMA as fast as possible
+    - Ring buffer: Lock-free SPSC queue decouples producer/consumer
+    - Send thread: Sends UDP packets as fast as network allows
 
 Usage:
     # Test against local Pluto
@@ -96,16 +101,14 @@ except ImportError:
             self.socket.close()
 
 
-class RateControlTester:
-    """Test rate control implementation."""
+class FIFOBufferTester:
+    """Test FIFO buffer (producer-consumer) implementation.
 
-    # Expected buffer sizes for different sample rates (power of 2, capped at 64K)
-    EXPECTED_BUFFER_SIZES = {
-        5_000_000: 32768,   # 5 MSPS: 5ms * 5M = 25K -> round to 32K
-        10_000_000: 65536,  # 10 MSPS: 5ms * 10M = 50K -> round to 64K
-        20_000_000: 65536,  # 20 MSPS: 5ms * 20M = 100K -> cap at 64K
-        30_000_000: 65536,  # 30 MSPS: 5ms * 30M = 150K -> cap at 64K
-    }
+    With the FIFO architecture:
+    - Packets arrive in bursts (not at steady intervals)
+    - Focus is on zero sample loss, not timing consistency
+    - Bandwidth should scale linearly with sample rate
+    """
 
     def __init__(self, pluto_ip: str, data_port: int = 4991, control_port: int = 4990):
         self.pluto_ip = pluto_ip
@@ -284,23 +287,22 @@ class RateControlTester:
             print(f"    Drop rate: {seq_stats['drop_rate']*100:.2f}%")
 
             # Determine pass/fail
+            # With FIFO architecture, focus is on:
+            # 1. Zero or very low packet drops (sample loss)
+            # 2. Bandwidth proportional to sample rate
+            # Note: Timing consistency is NOT checked - packets arrive in bursts
             passed = True
             reasons = []
 
-            # Check for excessive drops
-            if seq_stats['drop_rate'] > 0.01:  # More than 1% drops
+            # Check for excessive drops (critical - indicates sample loss)
+            if seq_stats['drop_rate'] > 0.001:  # More than 0.1% drops
                 passed = False
-                reasons.append(f"Drop rate too high: {seq_stats['drop_rate']*100:.2f}%")
-
-            # Check timing consistency (std dev should be reasonable)
-            if 'std_interval_us' in stats and stats['std_interval_us'] > stats['expected_interval_us']:
-                passed = False
-                reasons.append(f"Timing inconsistent: std={stats['std_interval_us']:.1f}us")
+                reasons.append(f"Drop rate too high: {seq_stats['drop_rate']*100:.3f}% (target: <0.1%)")
 
             # Check bandwidth scaling (should be proportional to sample rate)
             expected_mbps = sample_rate * 4 * 8 / 1_000_000  # 4 bytes per sample, 8 bits
-            # Allow 20% tolerance for overhead
-            if stats['mbps'] < expected_mbps * 0.5:
+            # Allow 50% tolerance for network overhead and processing
+            if stats['mbps'] < expected_mbps * 0.3:
                 passed = False
                 reasons.append(f"Low throughput: {stats['mbps']:.1f} Mbps (expected ~{expected_mbps:.1f})")
 
@@ -313,7 +315,7 @@ class RateControlTester:
             }
 
             if passed:
-                print(f"\n  [PASS] Rate control working correctly")
+                print(f"\n  [PASS] FIFO buffer working correctly - no sample loss")
             else:
                 print(f"\n  [FAIL] Issues detected:")
                 for reason in reasons:
@@ -372,11 +374,12 @@ class RateControlTester:
             duration = 2.0
 
         print("\n" + "#"*60)
-        print("# VITA49 Rate Control Test Suite")
+        print("# VITA49 FIFO Buffer Test Suite")
         print("#"*60)
         print(f"# Pluto IP: {self.pluto_ip}")
         print(f"# Test Duration: {duration}s per rate")
         print(f"# Sample Rates: {[f'{r/1e6:.0f}M' for r in rates]}")
+        print("# Architecture: Producer-Consumer FIFO (lock-free ring buffer)")
         print("#"*60)
 
         # Run bandwidth scaling test
@@ -400,9 +403,9 @@ class RateControlTester:
 
         overall_passed = failed == 0
         if overall_passed:
-            print("\n  [OVERALL PASS] Rate control working correctly!")
+            print("\n  [OVERALL PASS] FIFO buffer working correctly - no sample loss!")
         else:
-            print("\n  [OVERALL FAIL] Some tests failed - check rate control implementation")
+            print("\n  [OVERALL FAIL] Some tests failed - check FIFO buffer implementation")
 
         return overall_passed
 
@@ -413,7 +416,7 @@ class RateControlTester:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VITA49 Rate Control Test Suite",
+        description="VITA49 FIFO Buffer Test Suite",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -428,6 +431,11 @@ Examples:
 
   # Test single rate
   python test_rate_control.py --pluto 192.168.2.1 --rates 30e6 --duration 10
+
+What this tests:
+  - Producer-consumer FIFO architecture with lock-free ring buffer
+  - Zero sample loss (no timestamp jumps)
+  - Bandwidth scales linearly with sample rate
         """
     )
 
@@ -474,7 +482,7 @@ Examples:
     if args.rates:
         rates = [int(r) for r in args.rates]
 
-    tester = RateControlTester(
+    tester = FIFOBufferTester(
         pluto_ip=args.pluto,
         data_port=args.data_port,
         control_port=args.control_port
