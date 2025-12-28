@@ -465,41 +465,36 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     *len = sizeof(vrt_context_header_t) + payload_len;
 }
 
-/* Encode VITA49 Data packet - uses pre-computed timestamp for performance */
+/* Encode VITA49 Data packet - OPTIMIZED: no byte swapping
+ * Samples stay in native little-endian format.
+ * Receiver must decode as little-endian: np.frombuffer(payload, dtype='<i2')
+ */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count,
                                uint64_t timestamp_us) {
-    /* Validate buffer won't overflow */
-    size_t required_size = sizeof(vrt_data_header_t) +
-                          (num_samples * 2 * sizeof(int16_t)) +
-                          sizeof(uint32_t);  /* trailer */
-
-    if (required_size > MAX_PACKET_BUFFER) {
-        fprintf(stderr, "ERROR: Packet would exceed buffer size (%zu > %d)\n",
-                required_size, MAX_PACKET_BUFFER);
+    if (num_samples == 0) {
         *len = 0;
         return;
     }
 
     vrt_data_header_t *hdr = (vrt_data_header_t *)buf;
-    int16_t *payload = (int16_t *)(buf + sizeof(vrt_data_header_t));
+    uint8_t *payload = buf + sizeof(vrt_data_header_t);
 
-    /* Copy and convert to big-endian */
-    for (size_t i = 0; i < num_samples * 2; i++) {
-        payload[i] = htons(iq_data[i]);
-    }
+    /* Direct memcpy - samples stay in native (little) endian
+     * This eliminates ~60 million htons() calls/sec at 30 MSPS
+     */
+    size_t payload_bytes = num_samples * 4;  /* 2 bytes I + 2 bytes Q per sample */
+    memcpy(payload, iq_data, payload_bytes);
 
-    size_t payload_bytes = num_samples * 2 * sizeof(int16_t);
-
-    /* Pad to 32-bit boundary */
+    /* Pad to 32-bit boundary if needed */
     size_t padding = (4 - (payload_bytes % 4)) % 4;
     if (padding) {
-        memset((uint8_t *)payload + payload_bytes, 0, padding);
+        memset(payload + payload_bytes, 0, padding);
         payload_bytes += padding;
     }
 
     /* Trailer */
-    uint32_t *trailer = (uint32_t *)(buf + sizeof(vrt_data_header_t) + payload_bytes);
+    uint32_t *trailer = (uint32_t *)(payload + payload_bytes);
     *trailer = htonl_custom(0x40000000);  /* valid_data = 1 */
 
     /* Calculate packet size */
