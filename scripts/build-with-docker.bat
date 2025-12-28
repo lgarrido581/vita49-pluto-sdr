@@ -39,24 +39,35 @@ docker run --rm -v "%cd%":/build pluto-builder || (
 )
 
 echo.
-echo [3/3] Checking binary...
+echo [3/3] Checking binaries...
 if exist vita49_streamer (
-    echo SUCCESS: Binary created!
+    echo SUCCESS: Streamer binary created!
     dir vita49_streamer
-    echo.
-    echo ==========================================
-    echo Next steps:
-    echo ==========================================
-    echo.
-    echo Deploy to Pluto with one of:
-    echo   1. scp vita49_streamer root@pluto.local:/root/
-    echo   2. Use WinSCP GUI
-    echo   3. Use deploy-to-pluto.bat
-    echo.
 ) else (
-    echo ERROR: Binary not found
+    echo ERROR: vita49_streamer not found
     pause
     exit /b 1
 )
+
+if exist iio_buffer_diagnostic (
+    echo SUCCESS: Diagnostic binary created!
+    dir iio_buffer_diagnostic
+) else (
+    echo WARNING: iio_buffer_diagnostic not found
+)
+
+echo.
+echo ==========================================
+echo Next steps:
+echo ==========================================
+echo.
+echo Deploy to Pluto:
+echo   scripts\deploy_to_pluto.bat              Run streamer
+echo   scripts\deploy_to_pluto.bat --diag       Run diagnostic
+echo.
+echo Or manually:
+echo   scp vita49_streamer root@pluto.local:/root/
+echo   scp iio_buffer_diagnostic root@pluto.local:/root/
+echo.
 
 pause

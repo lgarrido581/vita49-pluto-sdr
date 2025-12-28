@@ -16,4 +16,5 @@ ENV PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig
 ENV PKG_CONFIG_LIBDIR=/usr/lib/arm-linux-gnueabihf/pkgconfig
 
 WORKDIR /build
-CMD ["make", "cross"]
+# Build both streamer and diagnostic tool
+CMD ["make", "all-tools"]
