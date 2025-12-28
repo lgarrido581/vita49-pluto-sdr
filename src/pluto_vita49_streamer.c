@@ -852,7 +852,7 @@ static void *data_thread(void *arg) {
     return NULL;
 }
 
-/* Configure SDR */
+/* Configure SDR with verification */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
     struct iio_device *phy = iio_context_find_device(ctx, "ad9361-phy");
     if (!phy) {
@@ -861,44 +861,83 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
     }
 
     pthread_mutex_lock(&g_sdr_config.mutex);
+    uint64_t target_freq = g_sdr_config.center_freq_hz;
+    uint32_t target_rate = g_sdr_config.sample_rate_hz;
+    uint32_t target_bw = g_sdr_config.bandwidth_hz;
+    double target_gain = g_sdr_config.gain_db;
+    pthread_mutex_unlock(&g_sdr_config.mutex);
 
-    /* Set RX LO frequency */
-    struct iio_channel *ch = iio_device_find_channel(phy, "altvoltage0", true);
-    if (ch) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%llu", (unsigned long long)g_sdr_config.center_freq_hz);
-        iio_channel_attr_write(ch, "frequency", buf);
-    }
+    char buf[64];
+    ssize_t ret;
 
-    /* Set sample rate */
-    ch = iio_device_find_channel(phy, "voltage0", false);
-    if (ch) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%u", g_sdr_config.sample_rate_hz);
-        iio_channel_attr_write(ch, "sampling_frequency", buf);
-
-        snprintf(buf, sizeof(buf), "%u", g_sdr_config.bandwidth_hz);
-        iio_channel_attr_write(ch, "rf_bandwidth", buf);
-
-        snprintf(buf, sizeof(buf), "%.1f", g_sdr_config.gain_db);
-        iio_channel_attr_write(ch, "hardwaregain", buf);
-
-        iio_channel_attr_write(ch, "gain_control_mode", "manual");
-    }
-
-    /* Enable channels */
+    /* First, disable DMA channels before changing sample rate */
     struct iio_channel *rx0_i = iio_device_find_channel(dev, "voltage0", false);
     struct iio_channel *rx0_q = iio_device_find_channel(dev, "voltage1", false);
 
+    if (rx0_i) iio_channel_disable(rx0_i);
+    if (rx0_q) iio_channel_disable(rx0_q);
+
+    /* Set RX LO frequency */
+    struct iio_channel *lo_ch = iio_device_find_channel(phy, "altvoltage0", true);
+    if (lo_ch) {
+        snprintf(buf, sizeof(buf), "%llu", (unsigned long long)target_freq);
+        ret = iio_channel_attr_write(lo_ch, "frequency", buf);
+        if (ret < 0) {
+            fprintf(stderr, "[Config] WARNING: Failed to set frequency: %zd\n", ret);
+        }
+    }
+
+    /* Set sample rate on ad9361-phy RX channel */
+    struct iio_channel *phy_rx = iio_device_find_channel(phy, "voltage0", false);
+    if (phy_rx) {
+        /* Set sample rate */
+        snprintf(buf, sizeof(buf), "%u", target_rate);
+        ret = iio_channel_attr_write(phy_rx, "sampling_frequency", buf);
+        if (ret < 0) {
+            fprintf(stderr, "[Config] WARNING: Failed to set sample rate: %zd\n", ret);
+        }
+
+        /* Verify sample rate was applied */
+        char verify_buf[64] = {0};
+        ret = iio_channel_attr_read(phy_rx, "sampling_frequency", verify_buf, sizeof(verify_buf));
+        if (ret > 0) {
+            uint32_t actual_rate = (uint32_t)atoll(verify_buf);
+            if (actual_rate != target_rate) {
+                fprintf(stderr, "[Config] WARNING: Rate mismatch! Requested %u, got %u\n",
+                       target_rate, actual_rate);
+            } else {
+                printf("[Config] Sample rate verified: %u Hz\n", actual_rate);
+            }
+        }
+
+        /* Set bandwidth */
+        snprintf(buf, sizeof(buf), "%u", target_bw);
+        ret = iio_channel_attr_write(phy_rx, "rf_bandwidth", buf);
+        if (ret < 0) {
+            fprintf(stderr, "[Config] WARNING: Failed to set bandwidth: %zd\n", ret);
+        }
+
+        /* Set gain */
+        snprintf(buf, sizeof(buf), "%.1f", target_gain);
+        ret = iio_channel_attr_write(phy_rx, "hardwaregain", buf);
+        if (ret < 0) {
+            fprintf(stderr, "[Config] WARNING: Failed to set gain: %zd\n", ret);
+        }
+
+        iio_channel_attr_write(phy_rx, "gain_control_mode", "manual");
+    }
+
+    /* Small delay to let AD9361 PLLs settle after rate change */
+    usleep(10000);  /* 10ms */
+
+    /* Re-enable DMA channels for buffer creation */
     if (rx0_i) iio_channel_enable(rx0_i);
     if (rx0_q) iio_channel_enable(rx0_q);
 
     printf("[Config] Configured: %.1f MHz, %.1f MSPS, %.1f dB\n",
-           g_sdr_config.center_freq_hz / 1e6,
-           g_sdr_config.sample_rate_hz / 1e6,
-           g_sdr_config.gain_db);
-
-    pthread_mutex_unlock(&g_sdr_config.mutex);
+           target_freq / 1e6,
+           target_rate / 1e6,
+           target_gain);
 
     return 0;
 }
