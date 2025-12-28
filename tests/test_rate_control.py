@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-VITA49 FIFO Buffer Test Suite
+VITA49 Streamer Test Suite
 
-Tests the FIFO buffer (producer-consumer) implementation to verify:
-1. No sample loss (continuous timestamps)
+Tests the 2-thread DMA-paced streamer implementation to verify:
+1. No sample loss (continuous packet sequence)
 2. Bandwidth scales linearly with sample rate
 3. No packet drops under normal network conditions
-4. Ring buffer operates without overflow/underflow
 
-Architecture:
-    - Refill thread: Grabs samples from IIO DMA as fast as possible
-    - Ring buffer: Lock-free SPSC queue decouples producer/consumer
-    - Send thread: Sends UDP packets as fast as network allows
+Architecture (on Pluto):
+    - Data thread (Core 0): iio_buffer_refill() blocks ~2ms, then sends all packets
+    - Control thread (Core 1): Receives config, zero CPU when idle
+    - DMA blocking IS the pacing mechanism - no artificial delays
+
+Expected throughput (Gigabit Ethernet):
+    5 MSPS  -> ~40 Mbps
+    10 MSPS -> ~80 Mbps
+    20 MSPS -> ~160 Mbps
+    30 MSPS -> ~240 Mbps
 
 Usage:
     # Test against local Pluto
@@ -101,11 +106,12 @@ except ImportError:
             self.socket.close()
 
 
-class FIFOBufferTester:
-    """Test FIFO buffer (producer-consumer) implementation.
+class DMAStreamTester:
+    """Test 2-thread DMA-paced streamer implementation.
 
-    With the FIFO architecture:
-    - Packets arrive in bursts (not at steady intervals)
+    With the DMA-paced architecture:
+    - Data thread blocks on iio_buffer_refill() (~2ms at 30 MSPS)
+    - Packets arrive in bursts after each DMA refill completes
     - Focus is on zero sample loss, not timing consistency
     - Bandwidth should scale linearly with sample rate
     """
@@ -212,7 +218,7 @@ class FIFOBufferTester:
     def verify_packet_sequence(self, packets: List[Dict]) -> Dict:
         """Verify packet sequence numbers for drops/duplicates."""
         if len(packets) < 2:
-            return {'drops': 0, 'duplicates': 0, 'total': len(packets)}
+            return {'drops': 0, 'duplicates': 0, 'total': len(packets), 'drop_rate': 0.0}
 
         drops = 0
         duplicates = 0
@@ -315,7 +321,7 @@ class FIFOBufferTester:
             }
 
             if passed:
-                print(f"\n  [PASS] FIFO buffer working correctly - no sample loss")
+                print(f"\n  [PASS] DMA streaming working correctly - no sample loss")
             else:
                 print(f"\n  [FAIL] Issues detected:")
                 for reason in reasons:
@@ -374,12 +380,12 @@ class FIFOBufferTester:
             duration = 2.0
 
         print("\n" + "#"*60)
-        print("# VITA49 FIFO Buffer Test Suite")
+        print("# VITA49 DMA-Paced Streamer Test Suite")
         print("#"*60)
         print(f"# Pluto IP: {self.pluto_ip}")
         print(f"# Test Duration: {duration}s per rate")
         print(f"# Sample Rates: {[f'{r/1e6:.0f}M' for r in rates]}")
-        print("# Architecture: Producer-Consumer FIFO (lock-free ring buffer)")
+        print("# Architecture: 2-thread DMA-paced (refill blocks, then burst send)")
         print("#"*60)
 
         # Run bandwidth scaling test
@@ -403,9 +409,9 @@ class FIFOBufferTester:
 
         overall_passed = failed == 0
         if overall_passed:
-            print("\n  [OVERALL PASS] FIFO buffer working correctly - no sample loss!")
+            print("\n  [OVERALL PASS] DMA streaming working correctly - no sample loss!")
         else:
-            print("\n  [OVERALL FAIL] Some tests failed - check FIFO buffer implementation")
+            print("\n  [OVERALL FAIL] Some tests failed - check streamer implementation")
 
         return overall_passed
 
@@ -416,7 +422,7 @@ class FIFOBufferTester:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VITA49 FIFO Buffer Test Suite",
+        description="VITA49 DMA-Paced Streamer Test Suite",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -433,7 +439,7 @@ Examples:
   python test_rate_control.py --pluto 192.168.2.1 --rates 30e6 --duration 10
 
 What this tests:
-  - Producer-consumer FIFO architecture with lock-free ring buffer
+  - 2-thread DMA-paced architecture (iio_buffer_refill blocks, then burst send)
   - Zero sample loss (no timestamp jumps)
   - Bandwidth scales linearly with sample rate
         """
@@ -482,7 +488,7 @@ What this tests:
     if args.rates:
         rates = [int(r) for r in args.rates]
 
-    tester = FIFOBufferTester(
+    tester = DMAStreamTester(
         pluto_ip=args.pluto,
         data_port=args.data_port,
         control_port=args.control_port
