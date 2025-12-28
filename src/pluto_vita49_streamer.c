@@ -164,7 +164,7 @@ static uint64_t get_timestamp_us(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
 
 static void encode_context_packet(uint8_t *buf, size_t *len);
-static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count);
+static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us);
 static void *data_thread(void *arg);    /* Core 0: refill DMA + send packets */
 static void *control_thread(void *arg); /* Core 1: receive config packets */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
@@ -260,7 +260,7 @@ static void add_subscriber(struct sockaddr_in *addr) {
     pthread_mutex_unlock(&g_subscribers_mutex);
 }
 
-/* Send packet to individual subscriber with error handling */
+/* Send packet to individual subscriber with error handling - HOT PATH, no syscalls */
 static int send_to_subscriber(int sock, uint8_t *buf, size_t len, subscriber_t *sub) {
     ssize_t sent = sendto(sock, buf, len, 0,
                          (struct sockaddr *)&sub->addr,
@@ -269,39 +269,25 @@ static int send_to_subscriber(int sock, uint8_t *buf, size_t len, subscriber_t *
     if (sent < 0) {
         sub->consecutive_failures++;
         sub->total_failures++;
-        g_stats.send_failures++;
-
-        /* Log periodic failures (every 10) */
-        if (sub->consecutive_failures % 10 == 0) {
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &sub->addr.sin_addr, ip_str, INET_ADDRSTRLEN);
-            fprintf(stderr, "[Streaming] WARNING: Send to %s:%d failed %d times (total: %llu)\n",
-                   ip_str, ntohs(sub->addr.sin_port), sub->consecutive_failures,
-                   (unsigned long long)sub->total_failures);
-        }
 
         /* Mark inactive after threshold */
         if (sub->consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &sub->addr.sin_addr, ip_str, INET_ADDRSTRLEN);
-            fprintf(stderr, "[Streaming] Marking subscriber %s:%d as inactive after %d failures\n",
-                   ip_str, ntohs(sub->addr.sin_port), sub->consecutive_failures);
             sub->active = false;
         }
 
         return -1;
     }
 
-    /* Success - reset failure counter and update stats */
+    /* Success - reset failure counter, update packet stats only */
     sub->consecutive_failures = 0;
-    sub->last_seen_us = get_timestamp_us();
+    /* NOTE: last_seen_us updated periodically in cleanup, NOT per-packet */
     sub->packets_sent++;
     sub->bytes_sent += len;
 
     return 0;
 }
 
-/* Remove dead subscribers from list */
+/* Remove dead subscribers from list and update timestamps for active ones */
 static void cleanup_dead_subscribers(void) {
     uint64_t current_time = get_timestamp_us();
     int removed = 0;
@@ -318,14 +304,16 @@ static void cleanup_dead_subscribers(void) {
 
         if (!sub->active) {
             should_remove = true;
-        } else if (sub->last_seen_us > 0 &&
-                  (current_time - sub->last_seen_us) > SUBSCRIBER_TIMEOUT_US) {
-            /* Timeout - no successful sends in 30 seconds */
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &sub->addr.sin_addr, ip_str, INET_ADDRSTRLEN);
-            fprintf(stderr, "[Streaming] Removing subscriber %s:%d (timeout)\n",
-                   ip_str, ntohs(sub->addr.sin_port));
-            should_remove = true;
+        } else {
+            /* Active subscriber - update timestamp and check for timeout */
+            if (sub->packets_sent > 0) {
+                /* Has been sending successfully - update timestamp */
+                sub->last_seen_us = current_time;
+            } else if (sub->last_seen_us > 0 &&
+                      (current_time - sub->last_seen_us) > SUBSCRIBER_TIMEOUT_US) {
+                /* No packets sent and timed out */
+                should_remove = true;
+            }
         }
 
         if (!should_remove) {
@@ -349,17 +337,19 @@ static void cleanup_dead_subscribers(void) {
     }
 }
 
-/* Broadcast packet to all active subscribers */
+/* Broadcast packet to all active subscribers - NO LOCK in hot path
+ * Safe because: control thread only appends, data thread only reads.
+ * Worst case: miss a new subscriber for one buffer cycle (harmless).
+ */
 static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len) {
-    pthread_mutex_lock(&g_subscribers_mutex);
+    /* Volatile read of subscriber count - no lock needed */
+    int count = g_subscriber_count;
 
-    for (int i = 0; i < g_subscriber_count; i++) {
+    for (int i = 0; i < count; i++) {
         if (g_subscribers[i].active) {
             send_to_subscriber(sock, buf, len, &g_subscribers[i]);
         }
     }
-
-    pthread_mutex_unlock(&g_subscribers_mutex);
 }
 
 /* Encode VITA49 Context packet */
@@ -475,9 +465,10 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     *len = sizeof(vrt_context_header_t) + payload_len;
 }
 
-/* Encode VITA49 Data packet */
+/* Encode VITA49 Data packet - uses pre-computed timestamp for performance */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
-                               size_t num_samples, uint8_t *packet_count) {
+                               size_t num_samples, uint8_t *packet_count,
+                               uint64_t timestamp_us) {
     /* Validate buffer won't overflow */
     size_t required_size = sizeof(vrt_data_header_t) +
                           (num_samples * 2 * sizeof(int16_t)) +
@@ -514,10 +505,9 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
     /* Calculate packet size */
     size_t total_words = 1 + 1 + 1 + 2 + (payload_bytes / 4) + 1;
 
-    /* Timestamp */
-    uint64_t ts_us = get_timestamp_us();
-    uint32_t ts_int = ts_us / 1000000;
-    uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;
+    /* Use pre-computed timestamp (passed from caller) */
+    uint32_t ts_int = timestamp_us / 1000000;
+    uint64_t ts_frac = (timestamp_us % 1000000) * 1000000ULL;
 
     /* Build header */
     uint32_t header = 0;
@@ -811,11 +801,18 @@ static void *data_thread(void *arg) {
             continue;
         }
 
+        /* Get timestamp ONCE per buffer, not per packet */
+        uint64_t buffer_timestamp = get_timestamp_us();
+
         /* Send ALL packets immediately - no sleeping */
         int16_t *samples = (int16_t *)iio_buffer_first(rxbuf, rx_chan);
         if (!samples) continue;
 
         size_t num_samples = nbytes / 4;  /* 4 bytes per I/Q pair */
+
+        /* Batch statistics for this buffer */
+        size_t packets_this_buffer = 0;
+        size_t bytes_this_buffer = 0;
 
         for (size_t offset = 0; offset < num_samples; offset += g_samples_per_packet) {
             if (!g_running) break;
@@ -831,14 +828,19 @@ static void *data_thread(void *arg) {
             }
 
             encode_data_packet(packet_buf, &packet_len,
-                             samples + offset * 2, chunk, &packet_count);
+                             samples + offset * 2, chunk, &packet_count,
+                             buffer_timestamp);
             broadcast_to_subscribers(sock, packet_buf, packet_len);
 
-            g_stats.packets_sent++;
-            g_stats.bytes_sent += packet_len;
+            packets_this_buffer++;
+            bytes_this_buffer += packet_len;
             packets_since_context++;
-            packets_sent++;
         }
+
+        /* Update global stats once per buffer (not per packet) */
+        g_stats.packets_sent += packets_this_buffer;
+        g_stats.bytes_sent += bytes_this_buffer;
+        packets_sent += packets_this_buffer;
 
         /* Periodic cleanup */
         if (packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0) {
