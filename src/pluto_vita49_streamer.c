@@ -10,6 +10,7 @@
  * - Zero dependencies beyond libiio (already on Pluto)
  * - Minimal memory footprint (~2 MB)
  * - Supports multiple simultaneous receivers
+ * - sendmmsg() batching for 64x syscall reduction (~1300 syscalls/sec vs 83000)
  *
  * Compilation:
  *   arm-linux-gnueabihf-gcc -o vita49_streamer pluto_vita49_streamer.c -liio -lpthread
@@ -21,7 +22,7 @@
  * License: MIT
  */
 
-#define _GNU_SOURCE  /* Required for CPU_ZERO, CPU_SET, pthread_setaffinity_np */
+#define _GNU_SOURCE  /* Required for CPU_ZERO, CPU_SET, pthread_setaffinity_np, sendmmsg */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,9 @@
 #define VITA49_OVERHEAD         (VITA49_HEADER_SIZE + VITA49_TRAILER_SIZE)
 #define IP_UDP_OVERHEAD         (IP_HEADER_SIZE + UDP_HEADER_SIZE)
 #define MAX_PACKET_BUFFER       16384           /* Support jumbo frames */
+
+/* sendmmsg() batching - reduces syscalls from 83,000/sec to ~1,300/sec */
+#define SEND_BATCH_SIZE         64              /* Packets per sendmmsg() call */
 
 /* VITA49 Packet Types */
 #define VRT_PKT_TYPE_DATA       0x1             /* IF Data with Stream ID */
@@ -154,6 +158,14 @@ typedef struct {
 } vrt_context_header_t;
 #pragma pack(pop)
 
+/* Packet batch for sendmmsg() - reduces syscall overhead by 64x */
+typedef struct {
+    uint8_t data[SEND_BATCH_SIZE][MAX_PACKET_BUFFER];   /* Packet buffers */
+    struct iovec iov[SEND_BATCH_SIZE];                  /* IO vectors */
+    struct mmsghdr msgs[SEND_BATCH_SIZE];               /* Message headers */
+    size_t count;                                        /* Packets in batch */
+} packet_batch_t;
+
 /* Function prototypes */
 static void signal_handler(int sig);
 static void add_subscriber(struct sockaddr_in *addr);
@@ -168,6 +180,13 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size
 static void *data_thread(void *arg);    /* Core 0: refill DMA + send packets */
 static void *control_thread(void *arg); /* Core 1: receive config packets */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
+
+/* Batch sending functions - sendmmsg() for 64x syscall reduction */
+static void batch_init(packet_batch_t *batch);
+static uint8_t *batch_get_buffer(packet_batch_t *batch);
+static void batch_commit_packet(packet_batch_t *batch, size_t len);
+static int batch_flush_to_subscriber(int sock, packet_batch_t *batch, subscriber_t *sub);
+static int batch_flush_to_all_subscribers(int sock, packet_batch_t *batch);
 
 /* Utility functions */
 static inline uint32_t htonl_custom(uint32_t x) {
@@ -350,6 +369,105 @@ static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len) {
             send_to_subscriber(sock, buf, len, &g_subscribers[i]);
         }
     }
+}
+
+/* ========================================================================
+ * sendmmsg() Batch Functions - Reduce syscalls by 64x
+ *
+ * Instead of: 83,000 sendto() calls/sec (one per packet)
+ * We now do:  ~1,300 sendmmsg() calls/sec (64 packets per call)
+ *
+ * This eliminates the syscall overhead that was limiting throughput.
+ * ======================================================================== */
+
+/* Initialize batch for new round of packets */
+static void batch_init(packet_batch_t *batch) {
+    batch->count = 0;
+    memset(batch->msgs, 0, sizeof(batch->msgs));
+}
+
+/* Get pointer to next available packet buffer in batch */
+static uint8_t *batch_get_buffer(packet_batch_t *batch) {
+    if (batch->count >= SEND_BATCH_SIZE) {
+        return NULL;  /* Batch full - caller should flush first */
+    }
+    return batch->data[batch->count];
+}
+
+/* Commit a packet to the batch after encoding */
+static void batch_commit_packet(packet_batch_t *batch, size_t len) {
+    if (batch->count >= SEND_BATCH_SIZE) {
+        return;  /* Should not happen - caller should check */
+    }
+
+    size_t idx = batch->count;
+
+    /* Set up iovec pointing to this packet's data */
+    batch->iov[idx].iov_base = batch->data[idx];
+    batch->iov[idx].iov_len = len;
+
+    /* Set up mmsghdr - destination will be set during flush */
+    batch->msgs[idx].msg_hdr.msg_iov = &batch->iov[idx];
+    batch->msgs[idx].msg_hdr.msg_iovlen = 1;
+
+    batch->count++;
+}
+
+/* Flush batch to a single subscriber using sendmmsg() */
+static int batch_flush_to_subscriber(int sock, packet_batch_t *batch, subscriber_t *sub) {
+    if (batch->count == 0) {
+        return 0;
+    }
+
+    /* Set destination for all messages in batch */
+    for (size_t i = 0; i < batch->count; i++) {
+        batch->msgs[i].msg_hdr.msg_name = &sub->addr;
+        batch->msgs[i].msg_hdr.msg_namelen = sizeof(sub->addr);
+    }
+
+    /* Single syscall sends all packets */
+    int sent = sendmmsg(sock, batch->msgs, batch->count, 0);
+
+    if (sent < 0) {
+        sub->consecutive_failures++;
+        sub->total_failures++;
+        if (sub->consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+            sub->active = false;
+        }
+        return -1;
+    }
+
+    /* Success - update subscriber stats */
+    sub->consecutive_failures = 0;
+    sub->packets_sent += sent;
+
+    /* Calculate bytes sent from individual message lengths */
+    for (int i = 0; i < sent; i++) {
+        sub->bytes_sent += batch->msgs[i].msg_len;
+    }
+
+    return sent;
+}
+
+/* Flush batch to all active subscribers */
+static int batch_flush_to_all_subscribers(int sock, packet_batch_t *batch) {
+    if (batch->count == 0) {
+        return 0;
+    }
+
+    int count = g_subscriber_count;  /* Volatile read */
+    int total_sent = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (g_subscribers[i].active) {
+            int sent = batch_flush_to_subscriber(sock, batch, &g_subscribers[i]);
+            if (sent > 0) {
+                total_sent += sent;
+            }
+        }
+    }
+
+    return total_sent;
 }
 
 /* Encode VITA49 Context packet */
@@ -731,8 +849,18 @@ static void *data_thread(void *arg) {
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     printf("[Data] Started - pinned to Core 0\n");
+    printf("[Data] Using sendmmsg() batching: %d packets/syscall\n", SEND_BATCH_SIZE);
 
-    uint8_t packet_buf[2048];
+    /* Allocate batch on heap - it's ~1MB due to packet buffers */
+    packet_batch_t *batch = calloc(1, sizeof(packet_batch_t));
+    if (!batch) {
+        fprintf(stderr, "[Data] ERROR: Failed to allocate batch buffer\n");
+        close(sock);
+        iio_buffer_destroy(rxbuf);
+        return NULL;
+    }
+
+    uint8_t context_buf[2048];  /* Context packets sent immediately (rare) */
     size_t packet_len;
     uint8_t packet_count = 0;
     int packets_since_context = 0;
@@ -745,6 +873,12 @@ static void *data_thread(void *arg) {
         pthread_mutex_unlock(&g_sdr_config.mutex);
 
         if (reconfig) {
+            /* Flush any pending packets before reconfiguring */
+            if (batch->count > 0) {
+                batch_flush_to_all_subscribers(sock, batch);
+                batch_init(batch);
+            }
+
             printf("[Data] ========================================\n");
             printf("[Data] Configuration change detected\n");
 
@@ -778,8 +912,8 @@ static void *data_thread(void *arg) {
                        rate / 1e6);
 
                 /* Notify subscribers of config change */
-                encode_context_packet(packet_buf, &packet_len);
-                broadcast_to_subscribers(sock, packet_buf, packet_len);
+                encode_context_packet(context_buf, &packet_len);
+                broadcast_to_subscribers(sock, context_buf, packet_len);
                 g_stats.contexts_sent++;
                 g_stats.reconfigs++;
             }
@@ -805,6 +939,9 @@ static void *data_thread(void *arg) {
 
         size_t num_samples = nbytes / 4;  /* 4 bytes per I/Q pair */
 
+        /* Initialize batch for this DMA buffer */
+        batch_init(batch);
+
         /* Batch statistics for this buffer */
         size_t packets_this_buffer = 0;
         size_t bytes_this_buffer = 0;
@@ -814,22 +951,42 @@ static void *data_thread(void *arg) {
 
             size_t chunk = MIN(g_samples_per_packet, num_samples - offset);
 
-            /* Periodic context packets */
+            /* Periodic context packets - send immediately (rare, 1 per 100 data pkts) */
             if (packets_since_context >= CONTEXT_INTERVAL) {
-                encode_context_packet(packet_buf, &packet_len);
-                broadcast_to_subscribers(sock, packet_buf, packet_len);
+                /* Flush data batch first */
+                if (batch->count > 0) {
+                    batch_flush_to_all_subscribers(sock, batch);
+                    batch_init(batch);
+                }
+                encode_context_packet(context_buf, &packet_len);
+                broadcast_to_subscribers(sock, context_buf, packet_len);
                 g_stats.contexts_sent++;
                 packets_since_context = 0;
             }
 
-            encode_data_packet(packet_buf, &packet_len,
+            /* Get buffer from batch */
+            uint8_t *pkt_buf = batch_get_buffer(batch);
+            if (!pkt_buf) {
+                /* Batch full - flush and get new buffer */
+                batch_flush_to_all_subscribers(sock, batch);
+                batch_init(batch);
+                pkt_buf = batch_get_buffer(batch);
+            }
+
+            /* Encode packet into batch buffer */
+            encode_data_packet(pkt_buf, &packet_len,
                              samples + offset * 2, chunk, &packet_count,
                              buffer_timestamp);
-            broadcast_to_subscribers(sock, packet_buf, packet_len);
+            batch_commit_packet(batch, packet_len);
 
             packets_this_buffer++;
             bytes_this_buffer += packet_len;
             packets_since_context++;
+        }
+
+        /* Flush remaining packets in batch */
+        if (batch->count > 0) {
+            batch_flush_to_all_subscribers(sock, batch);
         }
 
         /* Update global stats once per buffer (not per packet) */
@@ -842,6 +999,8 @@ static void *data_thread(void *arg) {
             cleanup_dead_subscribers();
         }
     }
+
+    free(batch);
 
     printf("[Data] Stopped\n");
     close(sock);
