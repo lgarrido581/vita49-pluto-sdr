@@ -21,6 +21,8 @@
  * License: MIT
  */
 
+#define _GNU_SOURCE  /* Required for CPU_ZERO, CPU_SET, pthread_setaffinity_np */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
