@@ -76,14 +76,43 @@ This release represents a major cleanup from the development workspace:
 - Added professional project files
 - See MIGRATION_PLAN.md for detailed reorganization history
 
-## [Unreleased]
+## [Unreleased] - Multicore Optimization (v1.1.0)
 
-### Planned
+### Added - 2025-01-08
+- **Multicore optimization implementation** - Split processing across both ARM cores
+- **Lock-free ring buffer** - Zero-copy IQ data transfer between DMA and network threads  
+- **Dual-core architecture**: Core 0 (DMA reader) + Core 1 (Network TX + Config)
+- **Performance monitoring** - Per-core CPU utilization tracking
+- **IRQ affinity setup** - Pin network interrupts to Core 1
+- **CPU isolation** - Dedicated cores with performance governor
+- **TROUBLESHOOTING.md** - Documentation for common issues and debugging
+
+### Changed - 2025-01-08
+- **Thread architecture**: 2-thread producer/consumer model replacing single data thread
+- **DMA processing**: Moved to dedicated Core 0 thread with high priority
+- **Network transmission**: Moved to dedicated Core 1 thread with VITA49 encoding  
+- **Configuration handling**: Merged into Core 1 thread (non-blocking)
+- **Memory management**: Pre-allocated ring buffer eliminates malloc/free overhead
+
+### Performance Improvements - 2025-01-08
+- **Target**: 95% utilization on both cores (vs current 50% single core)
+- **Expected bandwidth**: 400+ Mbps (vs current 240 Mbps)  
+- **Latency reduction**: <500μs (vs current 2-3ms)
+- **Cache optimization**: Core-specific data locality
+
+### Testing - 2025-01-08
+- **Phase 1 Test**: Ring buffer correctness and performance
+- **Phase 2 Test**: DMA thread isolation and timing
+- **Phase 3 Test**: Core 1 combined workload validation
+- **Integration Test**: Full dual-core pipeline validation
+- **Performance Test**: CPU utilization and bandwidth measurement
+
+### Planned (Future)
 
 - Additional signal processing algorithms
 - GUI configuration tool
 - Windows native build support
-- Performance optimizations (SIMD)
+- GPU offload for preprocessing (Mali GPU)
 - Additional SDR platform support
 
 ---
