@@ -37,10 +37,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <signal.h>
-#include <math.h>
-#include <fcntl.h>
 #include <iio.h>
-#include "lock_free_ring_buffer.h"
 
 /* Configuration */
 #define DEFAULT_FREQ_HZ         2400000000ULL   /* 2.4 GHz */
@@ -91,16 +88,6 @@ static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime based on MTU */
 
-/* Multicore optimization: Global ring buffer for IQ data transfer */
-static lock_free_ring_buffer_t g_ring_buffer;
-static atomic_uint g_sequence_counter = ATOMIC_VAR_INIT(0);
-
-/* Thread argument structure for network thread (Phase 3) */
-typedef struct {
-    struct iio_context *iio_ctx;
-    int control_sock;
-} network_thread_args_t;
-
 /* Subscriber list */
 typedef struct {
     struct sockaddr_in addr;
@@ -139,7 +126,7 @@ static sdr_config_t g_sdr_config = {
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
-/* Statistics - simple counters, updated by threads */
+/* Statistics - simple counters, updated by data thread only */
 typedef struct {
     uint64_t packets_sent;
     uint64_t bytes_sent;
@@ -147,11 +134,6 @@ typedef struct {
     uint32_t reconfigs;
     uint64_t refill_failures;
     uint64_t send_failures;
-    
-    /* Multicore optimization stats */
-    uint64_t dma_buffers_processed;
-    uint64_t ring_buffer_drops;
-    uint64_t network_thread_processed;
 } stream_statistics_t;
 
 static stream_statistics_t g_stats = {0};
@@ -195,9 +177,8 @@ static size_t calculate_optimal_samples_per_packet(size_t mtu);
 
 static void encode_context_packet(uint8_t *buf, size_t *len);
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us);
-/* Multicore optimization thread functions */
-static void *dma_reader_thread(void *arg);     /* Core 0: DMA reader (producer) */
-static void *network_thread(void *arg);        /* Core 1: Network TX + Config (consumer) */
+static void *data_thread(void *arg);    /* Core 0: refill DMA + send packets */
+static void *control_thread(void *arg); /* Core 1: receive config packets */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
 
 /* Batch sending functions - sendmmsg() for 64x syscall reduction */
@@ -718,47 +699,124 @@ static int parse_context_packet(const uint8_t *buf, size_t len,
  * This thread blocks on recvfrom() until a config packet arrives.
  * Zero CPU usage while waiting.
  */
+static void *control_thread(void *arg) {
+    int *sock_fd = (int *)arg;
+    uint8_t buf[2048];
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
 
-/*
- * DMA Reader Thread (Core 0) - Multicore Optimization Producer
+    /* Pin to Core 1 */
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+
+    /* Set socket timeout so we can check g_running periodically */
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(*sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    printf("[Control] Listening on port %d - pinned to Core 1\n", CONTROL_PORT);
+    printf("[Control] Default: %.3f MHz, %.1f MSPS, %.1f dB\n",
+           g_sdr_config.center_freq_hz / 1e6,
+           g_sdr_config.sample_rate_hz / 1e6,
+           g_sdr_config.gain_db);
+
+    while (g_running) {
+        /* BLOCK here - zero CPU until packet arrives or timeout */
+        ssize_t recv_len = recvfrom(*sock_fd, buf, sizeof(buf), 0,
+                                   (struct sockaddr *)&client_addr, &client_len);
+
+        if (recv_len < 0) continue;
+
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+        printf("\n[Control] Config from %s (%zd bytes)\n", ip_str, recv_len);
+
+        /* Parse context packet */
+        uint64_t new_freq = g_sdr_config.center_freq_hz;
+        uint32_t new_rate = g_sdr_config.sample_rate_hz;
+        double new_gain = g_sdr_config.gain_db;
+
+        if (parse_context_packet(buf, recv_len, &new_freq, &new_rate, &new_gain) == 0) {
+            bool changed = false;
+
+            pthread_mutex_lock(&g_sdr_config.mutex);
+
+            if (new_freq != g_sdr_config.center_freq_hz) {
+                printf("[Control] Freq: %.3f -> %.3f MHz\n",
+                       g_sdr_config.center_freq_hz / 1e6, new_freq / 1e6);
+                g_sdr_config.center_freq_hz = new_freq;
+                changed = true;
+            }
+
+            if (new_rate != g_sdr_config.sample_rate_hz) {
+                printf("[Control] Rate: %.1f -> %.1f MSPS\n",
+                       g_sdr_config.sample_rate_hz / 1e6, new_rate / 1e6);
+                g_sdr_config.sample_rate_hz = new_rate;
+                g_sdr_config.bandwidth_hz = new_rate * 0.8;
+                changed = true;
+            }
+
+            if (new_gain != g_sdr_config.gain_db) {
+                printf("[Control] Gain: %.1f -> %.1f dB\n",
+                       g_sdr_config.gain_db, new_gain);
+                g_sdr_config.gain_db = new_gain;
+                changed = true;
+            }
+
+            if (changed) {
+                g_sdr_config.config_changed = true;
+                printf("[Control] Config queued for data thread\n");
+            }
+
+            pthread_mutex_unlock(&g_sdr_config.mutex);
+        }
+
+        /* Add as subscriber */
+        client_addr.sin_port = htons(DATA_PORT);
+        add_subscriber(&client_addr);
+    }
+
+    printf("[Control] Stopped\n");
+    return NULL;
+}
+
+/**
+ * Data thread (Core 0) - Refills DMA buffer and sends packets
  *
- * Dedicated to reading IQ samples from DMA and pushing to ring buffer.
- * Runs on Core 0 with high priority for minimal latency.
- * 
- * Key optimizations:
- * - Fast memcpy of entire DMA buffer (no sample-by-sample loops)
- * - Lock-free ring buffer push (no mutex contention) 
- * - Pre-allocated buffer pool (no malloc/free)
- * - Natural DMA pacing (iio_buffer_refill blocks ~2ms)
+ * Key insight: iio_buffer_refill() naturally blocks for ~2ms at 30 MSPS,
+ * and the send loop takes ~1.8ms. This IS the pacing - no artificial
+ * delays needed, no ring buffer needed.
+ *
+ * Architecture:
+ *   while (running):
+ *     refill()   <- blocks ~2ms until DMA fills buffer
+ *     send_all() <- sends all packets immediately (~1.8ms)
+ *     loop       <- completes before next buffer ready
  */
-static void *dma_reader_thread(void *arg) {
+static void *data_thread(void *arg) {
     struct iio_context *ctx = (struct iio_context *)arg;
     struct iio_device *dev = iio_context_find_device(ctx, "cf-ad9361-lpc");
 
     if (!dev) {
-        fprintf(stderr, "[DMA Reader] ERROR: Device not found\n");
+        fprintf(stderr, "[Data] ERROR: Device not found\n");
         return NULL;
     }
 
-    /* Pin to Core 0 with high priority */
+    /* Pin to Core 0 for cache locality */
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(0, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-
-    /* Set high priority for DMA thread */
-    struct sched_param param;
-    param.sched_priority = 90;  /* High real-time priority */
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
-        printf("[DMA Reader] WARNING: Failed to set high priority\n");
-    }
 
     /* Configure SDR */
     if (configure_sdr(ctx, dev) < 0) {
         return NULL;
     }
 
-    /* Calculate buffer size: ~3ms worth of samples */
+    /* Calculate buffer size: ~3ms worth of samples, clamped to valid range */
     pthread_mutex_lock(&g_sdr_config.mutex);
     uint32_t rate = g_sdr_config.sample_rate_hz;
     pthread_mutex_unlock(&g_sdr_config.mutex);
@@ -768,20 +826,46 @@ static void *dma_reader_thread(void *arg) {
 
     struct iio_buffer *rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
     if (!rxbuf) {
-        fprintf(stderr, "[DMA Reader] ERROR: Failed to create buffer\n");
+        fprintf(stderr, "[Data] ERROR: Failed to create buffer\n");
         return NULL;
     }
 
     struct iio_channel *rx_chan = iio_device_find_channel(dev, "voltage0", false);
 
-    printf("[DMA Reader] Started - pinned to Core 0, priority 90\n");
-    printf("[DMA Reader] Buffer: %zu samples (%.2f ms at %.1f MSPS)\n",
+    printf("[Data] Created IIO buffer: %zu samples (%.2f ms at %.1f MSPS)\n",
            buffer_samples,
            (double)buffer_samples * 1000.0 / rate,
            rate / 1e6);
 
-    size_t buffer_idx = 0;
-    
+    /* Create UDP socket with large send buffer */
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        fprintf(stderr, "[Data] ERROR: Failed to create socket\n");
+        iio_buffer_destroy(rxbuf);
+        return NULL;
+    }
+
+    int sndbuf = 2 * 1024 * 1024;  /* 2 MB send buffer */
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    printf("[Data] Started - pinned to Core 0\n");
+    printf("[Data] Using sendmmsg() batching: %d packets/syscall\n", SEND_BATCH_SIZE);
+
+    /* Allocate batch on heap - it's ~1MB due to packet buffers */
+    packet_batch_t *batch = calloc(1, sizeof(packet_batch_t));
+    if (!batch) {
+        fprintf(stderr, "[Data] ERROR: Failed to allocate batch buffer\n");
+        close(sock);
+        iio_buffer_destroy(rxbuf);
+        return NULL;
+    }
+
+    uint8_t context_buf[2048];  /* Context packets sent immediately (rare) */
+    size_t packet_len;
+    uint8_t packet_count = 0;
+    int packets_since_context = 0;
+    uint64_t packets_sent = 0;
+
     while (g_running) {
         /* Check for reconfig (non-blocking check) */
         pthread_mutex_lock(&g_sdr_config.mutex);
@@ -789,34 +873,56 @@ static void *dma_reader_thread(void *arg) {
         pthread_mutex_unlock(&g_sdr_config.mutex);
 
         if (reconfig) {
-            printf("[DMA Reader] Configuration change detected, reconfiguring...\n");
-            
+            /* Flush any pending packets before reconfiguring */
+            if (batch->count > 0) {
+                batch_flush_to_all_subscribers(sock, batch);
+                batch_init(batch);
+            }
+
+            printf("[Data] ========================================\n");
+            printf("[Data] Configuration change detected\n");
+
             iio_buffer_destroy(rxbuf);
 
             if (configure_sdr(ctx, dev) < 0) {
-                fprintf(stderr, "[DMA Reader] ERROR: Failed to apply configuration\n");
-                break;
+                fprintf(stderr, "[Data] ERROR: Failed to apply configuration\n");
+                /* Try to recover with old buffer size */
+                rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
+                if (!rxbuf) {
+                    fprintf(stderr, "[Data] FATAL: Cannot recreate buffer\n");
+                    break;
+                }
+            } else {
+                pthread_mutex_lock(&g_sdr_config.mutex);
+                rate = g_sdr_config.sample_rate_hz;
+                g_sdr_config.config_changed = false;
+                pthread_mutex_unlock(&g_sdr_config.mutex);
+
+                buffer_samples = CLAMP((rate * BUFFER_TIME_MS) / 1000,
+                                       MIN_BUFFER_SAMPLES, MAX_BUFFER_SAMPLES);
+                rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
+                if (!rxbuf) {
+                    fprintf(stderr, "[Data] FATAL: Cannot create buffer\n");
+                    break;
+                }
+
+                printf("[Data] Buffer: %zu samples (%.2f ms at %.1f MSPS)\n",
+                       buffer_samples,
+                       (double)buffer_samples * 1000.0 / rate,
+                       rate / 1e6);
+
+                /* Notify subscribers of config change */
+                encode_context_packet(context_buf, &packet_len);
+                broadcast_to_subscribers(sock, context_buf, packet_len);
+                g_stats.contexts_sent++;
+                g_stats.reconfigs++;
             }
 
-            pthread_mutex_lock(&g_sdr_config.mutex);
-            rate = g_sdr_config.sample_rate_hz;
-            g_sdr_config.config_changed = false;
-            pthread_mutex_unlock(&g_sdr_config.mutex);
-
-            buffer_samples = CLAMP((rate * BUFFER_TIME_MS) / 1000,
-                                   MIN_BUFFER_SAMPLES, MAX_BUFFER_SAMPLES);
-            rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
-            if (!rxbuf) {
-                fprintf(stderr, "[DMA Reader] FATAL: Cannot recreate buffer\n");
-                break;
-            }
-
-            printf("[DMA Reader] Reconfigured: %zu samples at %.1f MSPS\n",
-                   buffer_samples, rate / 1e6);
-            g_stats.reconfigs++;
+            printf("[Data] ========================================\n");
+            packets_since_context = 0;
         }
 
-        /* BLOCK here until DMA fills buffer - natural pacing */
+        /* BLOCK here until DMA fills buffer - THIS IS THE NATURAL PACING */
         ssize_t nbytes = iio_buffer_refill(rxbuf);
         if (nbytes < 0) {
             g_stats.refill_failures++;
@@ -824,244 +930,81 @@ static void *dma_reader_thread(void *arg) {
             continue;
         }
 
-        /* Get pointer to DMA data */
+        /* Get timestamp ONCE per buffer, not per packet */
+        uint64_t buffer_timestamp = get_timestamp_us();
+
+        /* Send ALL packets immediately - no sleeping */
         int16_t *samples = (int16_t *)iio_buffer_first(rxbuf, rx_chan);
         if (!samples) continue;
 
         size_t num_samples = nbytes / 4;  /* 4 bytes per I/Q pair */
 
-        /* Prepare ring buffer entry */
-        iq_buffer_entry_t buffer_entry = {
-            .data = g_ring_buffer.sample_pool[buffer_idx],
-            .sample_count = num_samples,
-            .timestamp_us = get_timestamp_us(),
-            .sequence_num = atomic_fetch_add(&g_sequence_counter, 1),
-            .buffer_id = buffer_idx
-        };
+        /* Initialize batch for this DMA buffer */
+        batch_init(batch);
 
-        /* Fast memcpy - copy entire buffer at once (much faster than sample loops) */
-        memcpy(buffer_entry.data, samples, num_samples * 4);
+        /* Batch statistics for this buffer */
+        size_t packets_this_buffer = 0;
+        size_t bytes_this_buffer = 0;
 
-        /* Push to ring buffer (non-blocking) */
-        if (!ring_buffer_push(&g_ring_buffer, &buffer_entry)) {
-            g_stats.ring_buffer_drops++;
-            /* Ring buffer full - network thread may be overloaded */
-        } else {
-            g_stats.dma_buffers_processed++;
-        }
+        for (size_t offset = 0; offset < num_samples; offset += g_samples_per_packet) {
+            if (!g_running) break;
 
-        /* Rotate to next buffer in pool */
-        buffer_idx = (buffer_idx + 1) % RING_BUFFER_CAPACITY;
-    }
+            size_t chunk = MIN(g_samples_per_packet, num_samples - offset);
 
-    printf("[DMA Reader] Stopped\n");
-    iio_buffer_destroy(rxbuf);
-    return NULL;
-}
-
-/*
- * Network Thread (Core 1) - Multicore Optimization Consumer
- * 
- * Phase 3: Combined network transmission and configuration handling
- * Consumes from ring buffer and handles:
- * - VITA49 packet encoding from ring buffer IQ data
- * - sendmmsg() batch transmission  
- * - Configuration packet reception (merged from control_thread)
- * - Subscriber management
- * - Context packet transmission
- * 
- * This achieves 95% Core 1 utilization vs 10% in Phase 2.
- */
-static void *network_thread(void *arg) {
-    network_thread_args_t *args = (network_thread_args_t *)arg;
-    struct iio_context *ctx = args->iio_ctx;
-    int control_sock = args->control_sock;
-    
-    /* Pin to Core 1 */
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(1, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-
-    printf("[Network Thread] Started - pinned to Core 1\n");
-    printf("[Network Thread] Handling: Ring buffer consumption + Config + Network TX\n");
-
-    /* Create UDP socket for data transmission */
-    int data_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (data_sock < 0) {
-        fprintf(stderr, "[Network Thread] ERROR: Failed to create data socket\n");
-        return NULL;
-    }
-
-    /* Set large send buffer for burst transmission */
-    int sndbuf = 2 * 1024 * 1024;  /* 2 MB send buffer */
-    setsockopt(data_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-    /* Set control socket to non-blocking for polling */
-    int flags = fcntl(control_sock, F_GETFL, 0);
-    fcntl(control_sock, F_SETFL, flags | O_NONBLOCK);
-
-    /* Allocate packet batch on heap - it's ~1MB due to packet buffers */
-    packet_batch_t *batch = calloc(1, sizeof(packet_batch_t));
-    if (!batch) {
-        fprintf(stderr, "[Network Thread] ERROR: Failed to allocate batch buffer\n");
-        close(data_sock);
-        return NULL;
-    }
-
-    uint8_t context_buf[2048];  /* For immediate context packet transmission */
-    size_t context_packet_len;
-    uint8_t packet_count = 0;
-    int packets_since_context = 0;
-    uint64_t total_packets_sent = 0;
-
-    printf("[Network Thread] Using sendmmsg() batching: %d packets/syscall\n", SEND_BATCH_SIZE);
-
-    while (g_running) {
-        bool work_done = false;
-        
-        /* 1. Check for configuration packets (non-blocking) */
-        uint8_t config_buf[2048];
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        
-        ssize_t config_recv = recvfrom(control_sock, config_buf, sizeof(config_buf), 0,
-                                      (struct sockaddr *)&client_addr, &client_len);
-        
-        if (config_recv > 0) {
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
-            printf("\n[Network Thread] Config from %s (%zd bytes)\n", ip_str, config_recv);
-            
-            /* Parse and apply configuration */
-            uint64_t new_freq = g_sdr_config.center_freq_hz;
-            uint32_t new_rate = g_sdr_config.sample_rate_hz;
-            double new_gain = g_sdr_config.gain_db;
-            
-            if (parse_context_packet(config_buf, config_recv, &new_freq, &new_rate, &new_gain) == 0) {
-                bool changed = false;
-                
-                pthread_mutex_lock(&g_sdr_config.mutex);
-                
-                if (new_freq != g_sdr_config.center_freq_hz) {
-                    printf("[Network Thread] Freq: %.3f -> %.3f MHz\n",
-                           g_sdr_config.center_freq_hz / 1e6, new_freq / 1e6);
-                    g_sdr_config.center_freq_hz = new_freq;
-                    changed = true;
-                }
-                
-                if (new_rate != g_sdr_config.sample_rate_hz) {
-                    printf("[Network Thread] Rate: %.1f -> %.1f MSPS\n",
-                           g_sdr_config.sample_rate_hz / 1e6, new_rate / 1e6);
-                    g_sdr_config.sample_rate_hz = new_rate;
-                    changed = true;
-                }
-                
-                if (fabs(new_gain - g_sdr_config.gain_db) > 0.1) {
-                    printf("[Network Thread] Gain: %.1f -> %.1f dB\n",
-                           g_sdr_config.gain_db, new_gain);
-                    g_sdr_config.gain_db = new_gain;
-                    changed = true;
-                }
-                
-                if (changed) {
-                    g_sdr_config.config_changed = true;
-                }
-                
-                pthread_mutex_unlock(&g_sdr_config.mutex);
-                
-                /* Add client as subscriber */
-                add_subscriber(&client_addr);
-                
-                /* Send immediate context packet response */
-                encode_context_packet(context_buf, &context_packet_len);
-                sendto(data_sock, context_buf, context_packet_len, 0,
-                      (struct sockaddr *)&client_addr, sizeof(client_addr));
-                g_stats.contexts_sent++;
-                
-                work_done = true;
-            }
-        }
-        
-        /* 2. Consume IQ data from ring buffer and transmit */
-        iq_buffer_entry_t iq_buffer;
-        if (ring_buffer_pop(&g_ring_buffer, &iq_buffer)) {
-            /* Process entire IQ buffer into VITA49 packets */
-            batch_init(batch);
-            size_t packets_this_buffer = 0;
-            size_t bytes_this_buffer = 0;
-            
-            for (size_t offset = 0; offset < iq_buffer.sample_count; offset += g_samples_per_packet) {
-                size_t samples_this_packet = MIN(g_samples_per_packet, 
-                                                iq_buffer.sample_count - offset);
-                
-                /* Get buffer for this packet */
-                uint8_t *packet_buf = batch_get_buffer(batch);
-                size_t packet_len;
-                
-                /* Encode VITA49 data packet */
-                encode_data_packet(packet_buf, &packet_len,
-                                 iq_buffer.data + (offset * 2),  /* I/Q pairs */
-                                 samples_this_packet,
-                                 &packet_count,
-                                 iq_buffer.timestamp_us);
-                
-                batch_commit_packet(batch, packet_len);
-                packets_this_buffer++;
-                bytes_this_buffer += packet_len;
-                
-                /* Send context packet periodically */
-                packets_since_context++;
-                if (packets_since_context >= CONTEXT_INTERVAL) {
-                    /* Flush current batch first */
-                    if (batch->count > 0) {
-                        batch_flush_to_all_subscribers(data_sock, batch);
-                        batch_init(batch);
-                    }
-                    
-                    /* Send context packet immediately */
-                    encode_context_packet(context_buf, &context_packet_len);
-                    broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
-                    g_stats.contexts_sent++;
-                    packets_since_context = 0;
-                }
-                
-                /* Flush batch when full */
-                if (batch->count >= SEND_BATCH_SIZE) {
-                    batch_flush_to_all_subscribers(data_sock, batch);
+            /* Periodic context packets - send immediately (rare, 1 per 100 data pkts) */
+            if (packets_since_context >= CONTEXT_INTERVAL) {
+                /* Flush data batch first */
+                if (batch->count > 0) {
+                    batch_flush_to_all_subscribers(sock, batch);
                     batch_init(batch);
                 }
+                encode_context_packet(context_buf, &packet_len);
+                broadcast_to_subscribers(sock, context_buf, packet_len);
+                g_stats.contexts_sent++;
+                packets_since_context = 0;
             }
-            
-            /* Flush any remaining packets from this buffer */
-            if (batch->count > 0) {
-                batch_flush_to_all_subscribers(data_sock, batch);
+
+            /* Get buffer from batch */
+            uint8_t *pkt_buf = batch_get_buffer(batch);
+            if (!pkt_buf) {
+                /* Batch full - flush and get new buffer */
+                batch_flush_to_all_subscribers(sock, batch);
                 batch_init(batch);
+                pkt_buf = batch_get_buffer(batch);
             }
-            
-            /* Update statistics */
-            g_stats.network_thread_processed++;
-            g_stats.packets_sent += packets_this_buffer;
-            g_stats.bytes_sent += bytes_this_buffer;
-            total_packets_sent += packets_this_buffer;
-            
-            /* Periodic subscriber cleanup */
-            if (total_packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0) {
-                cleanup_dead_subscribers();
-            }
-            
-            work_done = true;
+
+            /* Encode packet into batch buffer */
+            encode_data_packet(pkt_buf, &packet_len,
+                             samples + offset * 2, chunk, &packet_count,
+                             buffer_timestamp);
+            batch_commit_packet(batch, packet_len);
+
+            packets_this_buffer++;
+            bytes_this_buffer += packet_len;
+            packets_since_context++;
         }
-        
-        /* 3. Brief sleep only if no work was done */
-        if (!work_done) {
-            usleep(10);  /* 10 microseconds - very brief */
+
+        /* Flush remaining packets in batch */
+        if (batch->count > 0) {
+            batch_flush_to_all_subscribers(sock, batch);
+        }
+
+        /* Update global stats once per buffer (not per packet) */
+        g_stats.packets_sent += packets_this_buffer;
+        g_stats.bytes_sent += bytes_this_buffer;
+        packets_sent += packets_this_buffer;
+
+        /* Periodic cleanup */
+        if (packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0) {
+            cleanup_dead_subscribers();
         }
     }
 
-    printf("[Network Thread] Stopped\n");
     free(batch);
-    close(data_sock);
+
+    printf("[Data] Stopped\n");
+    close(sock);
+    iio_buffer_destroy(rxbuf);
     return NULL;
 }
 
@@ -1173,15 +1116,15 @@ int main(int argc, char **argv) {
             printf("  --jumbo         Use jumbo frames (MTU 9000)\n");
             printf("  --mtu <size>    Set custom MTU size in bytes\n");
             printf("  --help, -h      Show this help message\n");
-            printf("\nArchitecture (Phase 3 - Multicore Optimization):\n");
-            printf("  Dual-core producer/consumer with lock-free ring buffer:\n");
-            printf("  - Core 0 (DMA Reader): High-priority DMA + ring buffer push (95%% CPU)\n");
-            printf("  - Core 1 (Network): Ring buffer consume + VITA49 encode + TX (95%% CPU)\n");
-            printf("\nExpected throughput (Optimized):\n");
-            printf("  5 MSPS  -> ~80 Mbps   (2x improvement)\n");
-            printf("  10 MSPS -> ~160 Mbps  (2x improvement)\n");
-            printf("  20 MSPS -> ~320 Mbps  (2x improvement)\n");
-            printf("  30 MSPS -> ~400 Mbps  (1.67x improvement, approaching Gigabit limit)\n");
+            printf("\nArchitecture:\n");
+            printf("  2-thread model using DMA blocking as natural pacing:\n");
+            printf("  - Data thread (Core 0): refill() blocks ~2ms, then sends all packets\n");
+            printf("  - Control thread (Core 1): receives config, zero CPU when idle\n");
+            printf("\nExpected throughput (Gigabit Ethernet):\n");
+            printf("  5 MSPS  -> ~40 Mbps\n");
+            printf("  10 MSPS -> ~80 Mbps\n");
+            printf("  20 MSPS -> ~160 Mbps\n");
+            printf("  30 MSPS -> ~240 Mbps\n");
             return 0;
         }
     }
@@ -1194,8 +1137,7 @@ int main(int argc, char **argv) {
     size_t total_udp_datagram = total_vita49_packet + IP_UDP_OVERHEAD;
 
     printf("========================================\n");
-    printf("VITA49 Streamer for Pluto (Multicore)\n");
-    printf("Phase 3: Dual-core optimization\n");
+    printf("VITA49 Streamer for Pluto (2-Thread)\n");
     printf("========================================\n");
     printf("MTU: %zu bytes%s\n", mtu, use_jumbo ? " (Jumbo)" : "");
     printf("Samples/packet: %zu\n", g_samples_per_packet);
@@ -1243,22 +1185,11 @@ int main(int argc, char **argv) {
 
     printf("Control: %d, Data: %d\n\n", CONTROL_PORT, DATA_PORT);
 
-    /* Initialize ring buffer for multicore optimization */
-    ring_buffer_init(&g_ring_buffer);
-    printf("Ring buffer initialized: %d entries, %zu MB\n", 
-           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer) / (1024*1024));
+    /* Start 2 threads: data (Core 0) and control (Core 1) */
+    pthread_t data_tid, control_tid;
 
-    /* Start multicore optimized threads - Phase 3: Full dual-core utilization */
-    pthread_t dma_tid, network_tid;
-    
-    /* Prepare arguments for network thread */
-    network_thread_args_t net_args = {
-        .iio_ctx = ctx,
-        .control_sock = control_sock
-    };
-
-    pthread_create(&dma_tid, NULL, dma_reader_thread, ctx);
-    pthread_create(&network_tid, NULL, network_thread, &net_args);
+    pthread_create(&data_tid, NULL, data_thread, ctx);
+    pthread_create(&control_tid, NULL, control_thread, &control_sock);
 
     /* Monitor loop - simple stats every 5 seconds */
     uint64_t last_packets = 0;
@@ -1279,16 +1210,6 @@ int main(int argc, char **argv) {
                (unsigned long long)pkt_delta,
                mbps, g_subscriber_count);
 
-        /* Phase 3: Full dual-core performance stats */
-        ring_buffer_stats_t rb_stats = ring_buffer_get_stats(&g_ring_buffer);
-        printf("[Core 0] DMA: %llu bufs processed, Ring pushes: %.1f%% success\n",
-               (unsigned long long)g_stats.dma_buffers_processed,
-               rb_stats.push_success_rate * 100.0);
-        printf("[Core 1] Network: %llu bufs consumed, Ring: %.1f%% full, Drops: %llu\n",
-               (unsigned long long)g_stats.network_thread_processed,
-               rb_stats.current_utilization * 100.0,
-               (unsigned long long)g_stats.ring_buffer_drops);
-
         if (g_stats.refill_failures > 0 || g_stats.send_failures > 0) {
             printf("[Errors] Refill: %llu, Send: %llu\n",
                    (unsigned long long)g_stats.refill_failures,
@@ -1300,8 +1221,8 @@ int main(int argc, char **argv) {
     }
 
     /* Cleanup */
-    pthread_join(dma_tid, NULL);
-    pthread_join(network_tid, NULL);
+    pthread_join(data_tid, NULL);
+    pthread_join(control_tid, NULL);
 
     close(control_sock);
     iio_context_destroy(ctx);

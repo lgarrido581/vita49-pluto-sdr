@@ -1,7 +1,24 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(.scriptsbuild-linuxptp-docker.bat)",
+      "Bash(cmd /c scriptsbuild-linuxptp-docker.bat)",
+      "Bash(timeout:*)",
+      "Bash(dir:*)",
+      "Bash(docker run:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(make test-ring-buffer:*)",
+      "Bash(make:*)",
+      "Bash(scripts/build-with-docker.bat)",
+      "Bash(cmd /c:*)",
+      "Bash(scriptsbuild-with-docker.bat)",
+      "Bash(.scriptsbuild-with-docker.bat)",
+      "Bash(cmd.exe:*)",
+      "Bash(docker:*)",
+      "Bash(powershell.exe:*)",
+      "Bash(sed:*)"
     ],
     "deny": [],
     "ask": []

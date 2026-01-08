@@ -45,22 +45,22 @@ typedef struct {
 /* Lock-Free Ring Buffer Structure */
 typedef struct {
     /* Cache-line aligned atomic indices to avoid false sharing */
-    alignas(CACHE_LINE_SIZE) atomic_size_t write_idx;
-    alignas(CACHE_LINE_SIZE) atomic_size_t read_idx;
+    atomic_size_t write_idx __attribute__((aligned(CACHE_LINE_SIZE)));
+    atomic_size_t read_idx __attribute__((aligned(CACHE_LINE_SIZE)));
     
     /* Ring buffer entries */
-    alignas(CACHE_LINE_SIZE) iq_buffer_entry_t entries[RING_BUFFER_CAPACITY];
+    iq_buffer_entry_t entries[RING_BUFFER_CAPACITY] __attribute__((aligned(CACHE_LINE_SIZE)));
     
     /* Pre-allocated sample buffer pool - eliminates malloc/free */
-    alignas(CACHE_LINE_SIZE) int16_t sample_pool[RING_BUFFER_CAPACITY][MAX_IQ_SAMPLES * 2];
+    int16_t sample_pool[RING_BUFFER_CAPACITY][MAX_IQ_SAMPLES * 2] __attribute__((aligned(CACHE_LINE_SIZE)));
     
     /* Statistics for monitoring */
-    alignas(CACHE_LINE_SIZE) atomic_uint64_t pushes_attempted;
-    atomic_uint64_t pushes_successful;
-    atomic_uint64_t pops_attempted;
-    atomic_uint64_t pops_successful;
-    atomic_uint64_t buffer_full_events;
-    atomic_uint64_t buffer_empty_events;
+    _Atomic uint64_t pushes_attempted __attribute__((aligned(CACHE_LINE_SIZE)));
+    _Atomic uint64_t pushes_successful;
+    _Atomic uint64_t pops_attempted;
+    _Atomic uint64_t pops_successful;
+    _Atomic uint64_t buffer_full_events;
+    _Atomic uint64_t buffer_empty_events;
     
 } lock_free_ring_buffer_t;
 
