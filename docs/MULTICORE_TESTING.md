@@ -200,42 +200,136 @@ done
 
 ### Test Cases (Phase 3)
 
-#### 3.1 Network Thread Consumer Test
+#### 3.1 Network Thread Combined Workload Test
 ```bash
-# Start with network thread consuming ring buffer
+# Deploy Phase 3 implementation
+make deploy
+
+# Start multicore streamer
+ssh root@pluto.local
 ./vita49_streamer &
 
-# Validate packet reception on host
-python tests/e2e/test_plotting_receiver.py --port 4991
-
-# Expected Core 1 utilization: 90-95%
+# Expected startup output:
+# Ring buffer initialized: 64 entries, 32 MB
+# [DMA Reader] Started - pinned to Core 0, priority 90
+# [Network Thread] Started - pinned to Core 1
+# [Network Thread] Handling: Ring buffer consumption + Config + Network TX
 ```
 
-#### 3.2 Full Dual-Core Performance Test
+**Success Criteria:**
+- ✅ Both threads start successfully
+- ✅ Ring buffer initialization completes
+- ✅ Network thread reports combined workload handling
+
+#### 3.2 Ring Buffer Consumer Validation
 ```bash
-# Run bandwidth scaling test
+# Send configuration to start data flow
+python src/vita49/config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
+
+# Monitor statistics (every 5 seconds):
+# [Core 0] DMA: X bufs processed, Ring pushes: 100.0% success
+# [Core 1] Network: Y bufs consumed, Ring: 5-20% full, Drops: 0
+```
+
+**Success Criteria:**
+- ✅ DMA buffers processed counter increases (Core 0 active)
+- ✅ Network buffers consumed counter increases (Core 1 active)  
+- ✅ Ring buffer utilization 5-20% (healthy flow)
+- ✅ Zero ring buffer drops
+- ✅ Push success rate 100%
+
+#### 3.3 Full Dual-Core Performance Test
+```bash
+# Run comprehensive rate scaling test
 python tests/test_rate_control.py --pluto pluto.local --rates 5e6 10e6 20e6 30e6
 
+# Monitor CPU utilization per core
+while true; do
+    echo "$(date): $(grep 'cpu[01]' /proc/stat)"
+    sleep 1
+done
+
 # Expected results:
-# - Linear bandwidth scaling  
-# - Core 0: 95% utilization
-# - Core 1: 95% utilization
-# - Total bandwidth >400 Mbps
+# Core 0: 95% utilization (vs 90% in Phase 2)
+# Core 1: 95% utilization (vs 10% in Phase 2)  
+# Total bandwidth: >400 Mbps (vs 240 Mbps baseline)
 ```
+
+**Success Criteria:**
+- ✅ Core 0 utilization 90-95% (high DMA throughput)
+- ✅ Core 1 utilization 90-95% (combined network + config load)
+- ✅ Linear bandwidth scaling across sample rates
+- ✅ Peak bandwidth approaching 400+ Mbps at 30 MSPS
+
+#### 3.4 Configuration Responsiveness Test
+```bash
+# Rapid configuration changes while streaming
+for freq in 2.4e9 2.45e9 2.5e9 2.4e9; do
+    python src/vita49/config_client.py --pluto pluto.local --freq $freq --rate 30e6 --gain 40
+    sleep 1
+    echo "Ring buffer stats after config change:"
+    # Monitor for drops or utilization spikes
+done
+```
+
+**Success Criteria:**
+- ✅ All configuration changes applied successfully
+- ✅ Network thread reports config reception
+- ✅ Ring buffer drops remain 0 during reconfigs
+- ✅ No degradation in packet transmission rate
+
+#### 3.5 Sustained Load Test (Hardware Stress)
+```bash
+# Extended operation (1 hour) at maximum rate
+ssh root@pluto.local
+timeout 3600 ./vita49_streamer > /tmp/vita49_phase3.log 2>&1 &
+
+# Configure for max rate
+python src/vita49/config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
+
+# Monitor memory usage
+while true; do
+    echo "$(date): $(cat /proc/meminfo | grep MemAvailable)" >> memory_phase3.log
+    sleep 60
+done
+
+# Expected after 1 hour:
+# - Ring buffer drops: Still 0
+# - Memory usage: Stable (no leaks)
+# - Both cores: Sustained 90-95% utilization
+# - Packet reception: Continuous on host
+```
+
+**Success Criteria:**
+- ✅ Zero memory leaks over extended operation
+- ✅ Ring buffer performance remains stable
+- ✅ No degradation in dual-core utilization
+- ✅ Continuous packet stream with no interruptions
 
 ---
 
 ## Performance Benchmarks
 
-### Target Performance (After Phase 2)
-| Metric | Single-Core (Before) | Phase 2 (DMA Split) | Phase 3 (Full) |
-|--------|---------------------|-------------------|----------------|
+### Performance Targets (All Phases Complete)
+| Metric | Single-Core (Before) | Phase 2 (DMA Split) | Phase 3 (Complete) |
+|--------|---------------------|-------------------|-------------------|
 | **Core 0 CPU** | 50% | 90% | 95% |
 | **Core 1 CPU** | 50% | 10% | 95% |
 | **Total CPU** | 50% | 50% | 95% |
 | **Bandwidth** | 240 Mbps | 240 Mbps | 400+ Mbps |
 | **Latency** | 2-3ms | 1-2ms | <500μs |
 | **Ring Buffer Drops** | N/A | 0 | 0 |
+| **Architecture** | Single thread | Producer only | Full producer/consumer |
+
+### Phase 3 Validation Criteria
+| Test Category | Expected Result | Acceptance Threshold |
+|---------------|----------------|---------------------|
+| **Core Utilization** | 95% both cores | >90% sustained |
+| **Ring Buffer Health** | 5-20% utilization | 0 drops, >99% push success |
+| **Bandwidth Improvement** | 400+ Mbps @ 30 MSPS | >350 Mbps (45% improvement) |
+| **Configuration Response** | <100ms config apply | All configs successful |
+| **Memory Stability** | Zero leaks | <1MB growth/hour |
+| **Network Thread Load** | Combined config + TX | >90% Core 1 utilization |
 
 ### Real-time Monitoring Commands
 
