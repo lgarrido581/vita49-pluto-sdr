@@ -38,6 +38,7 @@
 #include <time.h>
 #include <signal.h>
 #include <iio.h>
+#include "lock_free_ring_buffer.h"
 
 /* Configuration */
 #define DEFAULT_FREQ_HZ         2400000000ULL   /* 2.4 GHz */
@@ -88,6 +89,10 @@ static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime based on MTU */
 
+/* Multicore optimization: Global ring buffer for IQ data transfer */
+static lock_free_ring_buffer_t g_ring_buffer;
+static atomic_uint g_sequence_counter = ATOMIC_VAR_INIT(0);
+
 /* Subscriber list */
 typedef struct {
     struct sockaddr_in addr;
@@ -126,7 +131,7 @@ static sdr_config_t g_sdr_config = {
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
 
-/* Statistics - simple counters, updated by data thread only */
+/* Statistics - simple counters, updated by threads */
 typedef struct {
     uint64_t packets_sent;
     uint64_t bytes_sent;
@@ -134,6 +139,11 @@ typedef struct {
     uint32_t reconfigs;
     uint64_t refill_failures;
     uint64_t send_failures;
+    
+    /* Multicore optimization stats */
+    uint64_t dma_buffers_processed;
+    uint64_t ring_buffer_drops;
+    uint64_t network_thread_processed;
 } stream_statistics_t;
 
 static stream_statistics_t g_stats = {0};
@@ -177,8 +187,10 @@ static size_t calculate_optimal_samples_per_packet(size_t mtu);
 
 static void encode_context_packet(uint8_t *buf, size_t *len);
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us);
-static void *data_thread(void *arg);    /* Core 0: refill DMA + send packets */
-static void *control_thread(void *arg); /* Core 1: receive config packets */
+/* Multicore optimization thread functions */
+static void *dma_reader_thread(void *arg);     /* Core 0: DMA reader (producer) */
+static void *network_thread(void *arg);        /* Core 1: Network TX + Config (consumer) */
+static void *control_thread(void *arg);        /* Core 1: receive config packets (legacy) */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
 
 /* Batch sending functions - sendmmsg() for 64x syscall reduction */
@@ -1008,6 +1020,171 @@ static void *data_thread(void *arg) {
     return NULL;
 }
 
+/*
+ * DMA Reader Thread (Core 0) - Multicore Optimization Producer
+ *
+ * Dedicated to reading IQ samples from DMA and pushing to ring buffer.
+ * Runs on Core 0 with high priority for minimal latency.
+ * 
+ * Key optimizations:
+ * - Fast memcpy of entire DMA buffer (no sample-by-sample loops)
+ * - Lock-free ring buffer push (no mutex contention) 
+ * - Pre-allocated buffer pool (no malloc/free)
+ * - Natural DMA pacing (iio_buffer_refill blocks ~2ms)
+ */
+static void *dma_reader_thread(void *arg) {
+    struct iio_context *ctx = (struct iio_context *)arg;
+    struct iio_device *dev = iio_context_find_device(ctx, "cf-ad9361-lpc");
+
+    if (!dev) {
+        fprintf(stderr, "[DMA Reader] ERROR: Device not found\n");
+        return NULL;
+    }
+
+    /* Pin to Core 0 with high priority */
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+
+    /* Set high priority for DMA thread */
+    struct sched_param param;
+    param.sched_priority = 90;  /* High real-time priority */
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+        printf("[DMA Reader] WARNING: Failed to set high priority\n");
+    }
+
+    /* Configure SDR */
+    if (configure_sdr(ctx, dev) < 0) {
+        return NULL;
+    }
+
+    /* Calculate buffer size: ~3ms worth of samples */
+    pthread_mutex_lock(&g_sdr_config.mutex);
+    uint32_t rate = g_sdr_config.sample_rate_hz;
+    pthread_mutex_unlock(&g_sdr_config.mutex);
+
+    size_t buffer_samples = CLAMP((rate * BUFFER_TIME_MS) / 1000,
+                                  MIN_BUFFER_SAMPLES, MAX_BUFFER_SAMPLES);
+
+    struct iio_buffer *rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
+    if (!rxbuf) {
+        fprintf(stderr, "[DMA Reader] ERROR: Failed to create buffer\n");
+        return NULL;
+    }
+
+    struct iio_channel *rx_chan = iio_device_find_channel(dev, "voltage0", false);
+
+    printf("[DMA Reader] Started - pinned to Core 0, priority 90\n");
+    printf("[DMA Reader] Buffer: %zu samples (%.2f ms at %.1f MSPS)\n",
+           buffer_samples,
+           (double)buffer_samples * 1000.0 / rate,
+           rate / 1e6);
+
+    size_t buffer_idx = 0;
+    
+    while (g_running) {
+        /* Check for reconfig (non-blocking check) */
+        pthread_mutex_lock(&g_sdr_config.mutex);
+        bool reconfig = g_sdr_config.config_changed;
+        pthread_mutex_unlock(&g_sdr_config.mutex);
+
+        if (reconfig) {
+            printf("[DMA Reader] Configuration change detected, reconfiguring...\n");
+            
+            iio_buffer_destroy(rxbuf);
+
+            if (configure_sdr(ctx, dev) < 0) {
+                fprintf(stderr, "[DMA Reader] ERROR: Failed to apply configuration\n");
+                break;
+            }
+
+            pthread_mutex_lock(&g_sdr_config.mutex);
+            rate = g_sdr_config.sample_rate_hz;
+            g_sdr_config.config_changed = false;
+            pthread_mutex_unlock(&g_sdr_config.mutex);
+
+            buffer_samples = CLAMP((rate * BUFFER_TIME_MS) / 1000,
+                                   MIN_BUFFER_SAMPLES, MAX_BUFFER_SAMPLES);
+            rxbuf = iio_device_create_buffer(dev, buffer_samples, false);
+            if (!rxbuf) {
+                fprintf(stderr, "[DMA Reader] FATAL: Cannot recreate buffer\n");
+                break;
+            }
+
+            printf("[DMA Reader] Reconfigured: %zu samples at %.1f MSPS\n",
+                   buffer_samples, rate / 1e6);
+            g_stats.reconfigs++;
+        }
+
+        /* BLOCK here until DMA fills buffer - natural pacing */
+        ssize_t nbytes = iio_buffer_refill(rxbuf);
+        if (nbytes < 0) {
+            g_stats.refill_failures++;
+            usleep(1000);  /* Only sleep on error */
+            continue;
+        }
+
+        /* Get pointer to DMA data */
+        int16_t *samples = (int16_t *)iio_buffer_first(rxbuf, rx_chan);
+        if (!samples) continue;
+
+        size_t num_samples = nbytes / 4;  /* 4 bytes per I/Q pair */
+
+        /* Prepare ring buffer entry */
+        iq_buffer_entry_t buffer_entry = {
+            .data = g_ring_buffer.sample_pool[buffer_idx],
+            .sample_count = num_samples,
+            .timestamp_us = get_timestamp_us(),
+            .sequence_num = atomic_fetch_add(&g_sequence_counter, 1),
+            .buffer_id = buffer_idx
+        };
+
+        /* Fast memcpy - copy entire buffer at once (much faster than sample loops) */
+        memcpy(buffer_entry.data, samples, num_samples * 4);
+
+        /* Push to ring buffer (non-blocking) */
+        if (!ring_buffer_push(&g_ring_buffer, &buffer_entry)) {
+            g_stats.ring_buffer_drops++;
+            /* Ring buffer full - network thread may be overloaded */
+        } else {
+            g_stats.dma_buffers_processed++;
+        }
+
+        /* Rotate to next buffer in pool */
+        buffer_idx = (buffer_idx + 1) % RING_BUFFER_CAPACITY;
+    }
+
+    printf("[DMA Reader] Stopped\n");
+    iio_buffer_destroy(rxbuf);
+    return NULL;
+}
+
+/*
+ * Network Thread (Core 1) - Multicore Optimization Consumer
+ * 
+ * TODO: Phase 3 implementation
+ * This will consume from ring buffer and handle:
+ * - VITA49 packet encoding
+ * - sendmmsg() batch transmission  
+ * - Configuration packet reception (merged from control_thread)
+ * - Subscriber management
+ */
+static void *network_thread(void *arg) {
+    /* TODO: Implement Phase 3 - Combined network TX + config handling on Core 1 */
+    (void)arg;  /* Suppress unused parameter warning */
+    
+    printf("[Network Thread] TODO: Phase 3 implementation\n");
+    printf("[Network Thread] Will consume ring buffer and handle network TX\n");
+    
+    /* For now, just sleep to avoid busy loop */
+    while (g_running) {
+        sleep(1);
+    }
+    
+    return NULL;
+}
+
 /* Configure SDR with verification */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
     struct iio_device *phy = iio_context_find_device(ctx, "ad9361-phy");
@@ -1185,10 +1362,16 @@ int main(int argc, char **argv) {
 
     printf("Control: %d, Data: %d\n\n", CONTROL_PORT, DATA_PORT);
 
-    /* Start 2 threads: data (Core 0) and control (Core 1) */
-    pthread_t data_tid, control_tid;
+    /* Initialize ring buffer for multicore optimization */
+    ring_buffer_init(&g_ring_buffer);
+    printf("Ring buffer initialized: %d entries, %zu MB\n", 
+           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer) / (1024*1024));
 
-    pthread_create(&data_tid, NULL, data_thread, ctx);
+    /* Start multicore optimized threads */
+    pthread_t dma_tid, control_tid;
+
+    /* TODO: For full Phase 3, replace control_thread with network_thread */
+    pthread_create(&dma_tid, NULL, dma_reader_thread, ctx);
     pthread_create(&control_tid, NULL, control_thread, &control_sock);
 
     /* Monitor loop - simple stats every 5 seconds */
@@ -1210,6 +1393,13 @@ int main(int argc, char **argv) {
                (unsigned long long)pkt_delta,
                mbps, g_subscriber_count);
 
+        /* Multicore optimization stats */
+        ring_buffer_stats_t rb_stats = ring_buffer_get_stats(&g_ring_buffer);
+        printf("[Multicore] DMA: %llu bufs, Ring: %.1f%% full, Drops: %llu\n",
+               (unsigned long long)g_stats.dma_buffers_processed,
+               rb_stats.current_utilization * 100.0,
+               (unsigned long long)g_stats.ring_buffer_drops);
+
         if (g_stats.refill_failures > 0 || g_stats.send_failures > 0) {
             printf("[Errors] Refill: %llu, Send: %llu\n",
                    (unsigned long long)g_stats.refill_failures,
@@ -1221,7 +1411,7 @@ int main(int argc, char **argv) {
     }
 
     /* Cleanup */
-    pthread_join(data_tid, NULL);
+    pthread_join(dma_tid, NULL);
     pthread_join(control_tid, NULL);
 
     close(control_sock);
