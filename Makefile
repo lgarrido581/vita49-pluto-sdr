@@ -49,7 +49,7 @@ PLUTO_IP ?= pluto.local
 PLUTO_USER ?= root
 PLUTO_PASS ?= analog
 
-.PHONY: all native cross deploy clean install help diagnostic deploy-all
+.PHONY: all native cross deploy clean install help diagnostic deploy-all test-ring-buffer
 
 # Default target: cross-compile
 all: cross
@@ -225,3 +225,14 @@ help:
 	@echo "  build-with-docker.bat"
 	@echo "  make deploy-binary PLUTO_IP=pluto.local"
 	@echo ""
+
+# Test ring buffer implementation
+test-ring-buffer:
+	@echo "=========================================="
+	@echo "Testing Lock-Free Ring Buffer"
+	@echo "=========================================="
+	gcc -o tests/test_ring_buffer tests/test_ring_buffer.c -pthread -std=c11 -O2 -Wall -Wextra
+	./tests/test_ring_buffer
+	@rm -f tests/test_ring_buffer
+	@echo ""
+	@echo "✓ Ring buffer tests completed"
