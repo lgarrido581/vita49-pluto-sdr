@@ -11,6 +11,9 @@ Usage:
 
     # Quick reconfigure (change only frequency)
     python vita49_config_client.py --pluto 192.168.2.1 --freq 2.4e9
+
+    # Use fixed client port to avoid creating duplicate subscribers
+    python vita49_config_client.py --pluto 192.168.2.1 --freq 2.4e9 --client-port 50000
 """
 
 import argparse
@@ -24,13 +27,18 @@ class VITA49ConfigClient:
     Send configuration to Pluto via VITA49 Context packets.
     """
 
-    def __init__(self, pluto_ip, control_port=4990, data_port=4991):
+    def __init__(self, pluto_ip, control_port=4990, data_port=4991, client_port=0):
         self.pluto_ip = pluto_ip
         self.control_port = control_port
         self.data_port = data_port
         self.stream_id = 0x01000000  # Match server default
+        self.client_port = client_port  # Port to bind locally (0 = ephemeral)
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Bind to specific port to avoid creating new subscribers on each run
+        # Allow port reuse so we can quickly restart the client
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(('', self.client_port))
 
     def encode_context(self, sample_rate_hz=None, center_freq_hz=None,
                       bandwidth_hz=None, gain_db=None):
@@ -159,6 +167,9 @@ Examples:
   # Adjust gain only
   python vita49_config_client.py --pluto 192.168.2.1 --gain 20
 
+  # Use fixed port to prevent duplicate subscribers (recommended)
+  python vita49_config_client.py --pluto 192.168.2.1 --freq 2.4e9 --client-port 50000
+
 After sending config, Pluto will stream IQ samples to your PC.
 Use a receiver script to capture and process the data.
         """
@@ -205,6 +216,12 @@ Use a receiver script to capture and process the data.
         default=4991,
         help="Data port (default: 4991)"
     )
+    parser.add_argument(
+        '--client-port',
+        type=int,
+        default=0,
+        help="Local port to bind (default: 0 = random). Use fixed port to avoid duplicate subscribers."
+    )
 
     args = parser.parse_args()
 
@@ -224,7 +241,8 @@ Use a receiver script to capture and process the data.
     client = VITA49ConfigClient(
         pluto_ip=args.pluto,
         control_port=args.control_port,
-        data_port=args.data_port
+        data_port=args.data_port,
+        client_port=args.client_port
     )
 
     # Send configuration

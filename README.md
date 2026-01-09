@@ -100,7 +100,7 @@ This makes the `vita49` package available to all scripts and examples.
 - Registers you as a subscriber to receive the stream
 
 ```bash
-python src/vita49/config_client.py --pluto pluto.local --freq 2.4e9 --rate 30e6 --gain 40
+python src/vita49/config_client.py --pluto pluto.local --client-port 50000 --freq 2.4e9 --rate 30e6 --gain 40
 ```
 
 **What happens:**

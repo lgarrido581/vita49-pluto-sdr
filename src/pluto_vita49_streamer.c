@@ -874,7 +874,6 @@ static void *dma_reader_thread(void *arg) {
  */
 static void *network_thread(void *arg) {
     network_thread_args_t *args = (network_thread_args_t *)arg;
-    struct iio_context *ctx = args->iio_ctx;
     int control_sock = args->control_sock;
     
     /* Pin to Core 1 */
