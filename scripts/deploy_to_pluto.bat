@@ -64,9 +64,9 @@ echo [1/3] Stopping existing processes...
 plink -pw analog "%PLUTO_USER%@%PLUTO_IP%" "killall vita49_streamer iio_buffer_diagnostic 2>/dev/null; exit 0"
 
 echo [2/3] Copying binaries to Pluto...
-pscp -pw analog "vita49_streamer" "%PLUTO_USER%@%PLUTO_IP%:/root/"
+pscp -scp -pw analog "vita49_streamer" "%PLUTO_USER%@%PLUTO_IP%:/root/"
 if exist "iio_buffer_diagnostic" (
-    pscp -pw analog "iio_buffer_diagnostic" "%PLUTO_USER%@%PLUTO_IP%:/root/"
+    pscp -scp -pw analog "iio_buffer_diagnostic" "%PLUTO_USER%@%PLUTO_IP%:/root/"
 )
 
 echo [3/3] Setting permissions...
