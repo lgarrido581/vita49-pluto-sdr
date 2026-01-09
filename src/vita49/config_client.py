@@ -38,7 +38,21 @@ class VITA49ConfigClient:
         # Bind to specific port to avoid creating new subscribers on each run
         # Allow port reuse so we can quickly restart the client
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind(('', self.client_port))
+
+        try:
+            self.socket.bind(('', self.client_port))
+        except OSError as e:
+            # If port is already in use (e.g., stream handler listening), that's OK
+            # We can still send packets. Pluto will see our source port and respond there.
+            if self.client_port != 0:
+                import warnings
+                warnings.warn(f"Could not bind to port {self.client_port}: {e}. "
+                            f"Using ephemeral port instead. Config will still work.")
+                # Try binding to ephemeral port as fallback
+                self.socket.bind(('', 0))
+                self.client_port = self.socket.getsockname()[1]
+            else:
+                raise
 
     def encode_context(self, sample_rate_hz=None, center_freq_hz=None,
                       bandwidth_hz=None, gain_db=None):

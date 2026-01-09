@@ -9,7 +9,7 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status, 
     sample_rate_hz: 30e6,
     bandwidth_hz: 20e6,
     rx_gain_db: 20.0,
-    client_port: 50000  // Fixed port to avoid duplicate subscribers
+    client_port: 4991  // Must match backend listen port (4991)
   })
 
   const [isStreaming, setIsStreaming] = useState(false)
@@ -264,7 +264,7 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status, 
               step={1}
             />
             <div className="config-info" style={{ fontSize: '0.85em', marginTop: '5px', color: '#666' }}>
-              Fixed port prevents duplicate subscribers. Default: 50000. Must be 1024-65535.
+              Port where backend listens for VITA49 data. Default: 4991. Must match backend configuration.
             </div>
           </div>
         )}

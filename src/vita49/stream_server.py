@@ -697,6 +697,8 @@ class VITA49StreamClient:
         """Start receiving"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Allow port reuse so config client can also bind to same port
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
             self.socket.bind((self.listen_address, self.port))
             self.socket.settimeout(0.5)

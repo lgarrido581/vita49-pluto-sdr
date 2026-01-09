@@ -52,7 +52,7 @@ class PlutoConfig(BaseModel):
     sample_rate_hz: float = 30e6
     bandwidth_hz: float = 20e6
     rx_gain_db: float = 20.0
-    client_port: int = 50000  # Fixed port to avoid duplicate subscribers
+    client_port: int = 4991  # Must match backend listen port (4991)
 
 
 class StreamControl(BaseModel):
