@@ -161,14 +161,37 @@ A modern browser-based interface is available for real-time spectrum visualizati
 
 ### Running the Web UI
 
-**IMPORTANT: You need to run TWO servers simultaneously:**
+**Quick Start (Recommended):**
 
-**Terminal 1 - Backend Server (FastAPI):**
+Use the convenient startup scripts that automatically start both servers and open your browser:
+
 ```bash
-python -m vita49.web_server --host 0.0.0.0 --port 8001
+# Windows
+.\scripts\start-webui.bat
+
+# Linux/macOS
+./scripts/start-webui.sh
 ```
 
-**Terminal 2 - Frontend Dev Server (Vite):**
+These scripts will:
+
+- Start the backend server (FastAPI on port 8001)
+- Start the frontend dev server (Vite on port 3000)
+- Automatically open your browser to <http://localhost:3000>
+- Display both server logs in separate windows/terminals
+
+**Manual Method:**
+
+If you prefer manual control, run TWO servers simultaneously:
+
+**Terminal 1 - Backend Server:**
+```bash
+python -m vita49.web_server --host 0.0.0.0 --port 8001
+# Or use: ./scripts/start-backend-only.sh (Linux/macOS)
+# Or use: .\scripts\start-backend-only.bat (Windows)
+```
+
+**Terminal 2 - Frontend Dev Server:**
 ```bash
 cd src/vita49/web
 npm install  # First time only
@@ -180,9 +203,9 @@ npm run dev
 - The Vite dev server (port 3000) proxies API calls to the backend (port 8001)
 
 **Common Error:**
-If you see `ECONNREFUSED` errors in the browser console, it means the backend server (port 8001) is not running. Make sure both servers are running in separate terminals.
+If you see `ECONNREFUSED` errors in the browser console, it means the backend server (port 8001) is not running. Make sure both servers are running.
 
-See **[QUICKSTART_WEB_UI.md](QUICKSTART_WEB_UI.md)** for detailed setup instructions.
+See **[docs/QUICKSTART_WEB_UI.md](docs/QUICKSTART_WEB_UI.md)** for detailed setup instructions.
 
 ## Documentation
 
@@ -190,7 +213,7 @@ See **[QUICKSTART_WEB_UI.md](QUICKSTART_WEB_UI.md)** for detailed setup instruct
 - **[Build Guide](docs/BUILD.md)** - Build for all platforms (Linux/macOS/Windows)
 - **[Development Guide](docs/DEVELOPMENT.md)** - Architecture, testing, contributing
 - **[Packet Optimization Guide](docs/PACKET_OPTIMIZATION.md)** - MTU optimization and performance tuning
-- **[Web UI Quick Start](QUICKSTART_WEB_UI.md)** - Browser-based interface setup
+- **[Web UI Quick Start](docs/QUICKSTART_WEB_UI.md)** - Browser-based interface setup
 
 ## Installation
 

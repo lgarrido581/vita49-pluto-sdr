@@ -112,7 +112,7 @@ To access from phone/tablet on same network:
 
 - Read the complete guide: `docs/WEB_UI_GUIDE.md`
 - Explore the API: `src/vita49/web/README.md`
-- Check implementation details: `WEB_UI_SUMMARY.md`
+- Check implementation details: `docs/WEB_UI_SUMMARY.md`
 
 ## Support
 

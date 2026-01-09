@@ -74,7 +74,7 @@ This release represents a major cleanup from the development workspace:
 - Consolidated 8 documentation files into 4 comprehensive guides
 - Created proper Python package structure
 - Added professional project files
-- See MIGRATION_PLAN.md for detailed reorganization history
+- See docs/archive/MIGRATION_PLAN.md for detailed reorganization history
 
 ## [Unreleased] - Multicore Optimization (v1.1.0)
 
@@ -84,7 +84,7 @@ This release represents a major cleanup from the development workspace:
 - **Phase 3: Network thread** - Combined Core 1 consumer with config + transmission
 - **Dual-core architecture**: Full producer/consumer with 95% target utilization
 - **Performance monitoring** - Per-core statistics and ring buffer utilization tracking
-- **TROUBLESHOOTING.md** - Comprehensive debugging guide for multicore issues
+- **docs/TROUBLESHOOTING.md** - Comprehensive debugging guide for multicore issues
 - **MULTICORE_TESTING.md** - Phase-by-phase testing framework
 
 ### Changed - 2025-01-08

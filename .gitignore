@@ -26,13 +26,16 @@ nodeids
 *~
 
 # Build artifacts
-vita49_streamer
 *.o
 *.a
 *.exe
 *.dll
 *.so
 *.dylib
+
+# External build artifacts
+linuxptp-arm*
+build/
 
 # OS
 .DS_Store
