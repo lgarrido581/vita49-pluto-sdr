@@ -602,9 +602,8 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     *len = sizeof(vrt_context_header_t) + payload_len;
 }
 
-/* Encode VITA49 Data packet - OPTIMIZED: no byte swapping
- * Samples stay in native little-endian format.
- * Receiver must decode as little-endian: np.frombuffer(payload, dtype='<i2')
+/* Encode VITA49 Data packet with big-endian byte order (VITA49 standard)
+ * Samples are byte-swapped to big-endian for protocol compliance.
  */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count,
@@ -617,11 +616,18 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
     vrt_data_header_t *hdr = (vrt_data_header_t *)buf;
     uint8_t *payload = buf + sizeof(vrt_data_header_t);
 
-    /* Direct memcpy - samples stay in native (little) endian
-     * This eliminates ~60 million htons() calls/sec at 30 MSPS
+    /* Byte-swap samples to big-endian (VITA49 requirement)
+     * Each complex sample = 2 int16 values (I + Q)
      */
-    size_t payload_bytes = num_samples * 4;  /* 2 bytes I + 2 bytes Q per sample */
-    memcpy(payload, iq_data, payload_bytes);
+    size_t num_int16_values = num_samples * 2;  /* I and Q for each sample */
+    int16_t *src = iq_data;
+    int16_t *dst = (int16_t *)payload;
+
+    for (size_t i = 0; i < num_int16_values; i++) {
+        dst[i] = (int16_t)htons((uint16_t)src[i]);
+    }
+
+    size_t payload_bytes = num_int16_values * sizeof(int16_t);
 
     /* Pad to 32-bit boundary if needed */
     size_t padding = (4 - (payload_bytes % 4)) % 4;
