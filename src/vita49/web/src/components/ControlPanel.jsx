@@ -8,7 +8,8 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status, 
     center_freq_hz: 2.4e9,
     sample_rate_hz: 30e6,
     bandwidth_hz: 20e6,
-    rx_gain_db: 20.0
+    rx_gain_db: 20.0,
+    client_port: 50000  // Fixed port to avoid duplicate subscribers
   })
 
   const [isStreaming, setIsStreaming] = useState(false)
@@ -243,6 +244,28 @@ export default function ControlPanel({ onConfigChange, onStreamControl, status, 
               onChange={(e) => handleChange('pluto_uri', e.target.value)}
               placeholder="ip:pluto.local"
             />
+            <div className="config-warning" style={{ fontSize: '0.85em', marginTop: '5px' }}>
+              ⚠️ Using "pluto.local" may create duplicate subscribers if it resolves to multiple IPs.
+              Consider using the actual IP address (e.g., "ip:192.168.2.1") to avoid bandwidth waste.
+            </div>
+          </div>
+        )}
+
+        {showAdvanced && (
+          <div className="control-group">
+            <label>Client Port (prevents duplicate subscribers)</label>
+            <input
+              type="number"
+              className="number-input"
+              value={config.client_port}
+              onChange={(e) => handleChange('client_port', parseInt(e.target.value))}
+              min={1024}
+              max={65535}
+              step={1}
+            />
+            <div className="config-info" style={{ fontSize: '0.85em', marginTop: '5px', color: '#666' }}>
+              Fixed port prevents duplicate subscribers. Default: 50000. Must be 1024-65535.
+            </div>
           </div>
         )}
       </div>

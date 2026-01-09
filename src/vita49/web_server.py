@@ -52,6 +52,7 @@ class PlutoConfig(BaseModel):
     sample_rate_hz: float = 30e6
     bandwidth_hz: float = 20e6
     rx_gain_db: float = 20.0
+    client_port: int = 50000  # Fixed port to avoid duplicate subscribers
 
 
 class StreamControl(BaseModel):
@@ -450,11 +451,12 @@ async def _send_config_async(config: PlutoConfig):
 
         def send_config():
             try:
-                logger.debug(f"Thread pool: Creating VITA49ConfigClient for {pluto_ip}")
+                logger.debug(f"Thread pool: Creating VITA49ConfigClient for {pluto_ip} with client_port={config.client_port}")
                 client = VITA49ConfigClient(
                     pluto_ip=pluto_ip,
                     control_port=4990,
-                    data_port=4991
+                    data_port=4991,
+                    client_port=config.client_port
                 )
 
                 logger.debug("Thread pool: Calling configure()")
