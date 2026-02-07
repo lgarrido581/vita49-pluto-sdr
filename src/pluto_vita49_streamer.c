@@ -848,26 +848,86 @@ static void *dma_reader_thread(void *arg) {
         int16_t *samples = (int16_t *)iio_buffer_first(rxbuf, rx_chan);
         if (!samples) continue;
 
-        size_t num_samples = nbytes / 4;  /* 4 bytes per I/Q pair */
+        /* Read channel mode to determine buffer format */
+        pthread_mutex_lock(&g_sdr_config.mutex);
+        channel_mode_t mode = g_sdr_config.channel_mode;
+        pthread_mutex_unlock(&g_sdr_config.mutex);
 
-        /* Prepare ring buffer entry */
-        iq_buffer_entry_t buffer_entry = {
-            .data = g_ring_buffer_rx0.sample_pool[buffer_idx],
-            .sample_count = num_samples,
-            .timestamp_us = get_timestamp_us(),
-            .sequence_num = atomic_fetch_add(&g_sequence_counter_rx0, 1),
-            .buffer_id = buffer_idx
-        };
+        uint64_t timestamp_us = get_timestamp_us();
 
-        /* Fast memcpy - copy entire buffer at once (much faster than sample loops) */
-        memcpy(buffer_entry.data, samples, num_samples * 4);
+        if (mode == CHANNEL_MODE_DUAL) {
+            /* Dual-channel mode: 8 bytes per sample (RX0_I, RX0_Q, RX1_I, RX1_Q interleaved) */
+            size_t num_samples = nbytes / 8;
 
-        /* Push to ring buffer (non-blocking) */
-        if (!ring_buffer_push(&g_ring_buffer_rx0, &buffer_entry)) {
-            g_stats.ring_buffer_drops++;
-            /* Ring buffer full - network thread may be overloaded */
+            /* Prepare buffer entries for both channels */
+            iq_buffer_entry_t buffer_rx0 = {
+                .data = g_ring_buffer_rx0.sample_pool[buffer_idx],
+                .sample_count = num_samples,
+                .timestamp_us = timestamp_us,
+                .sequence_num = atomic_fetch_add(&g_sequence_counter_rx0, 1),
+                .buffer_id = buffer_idx
+            };
+
+            iq_buffer_entry_t buffer_rx1 = {
+                .data = g_ring_buffer_rx1.sample_pool[buffer_idx],
+                .sample_count = num_samples,
+                .timestamp_us = timestamp_us,
+                .sequence_num = atomic_fetch_add(&g_sequence_counter_rx1, 1),
+                .buffer_id = buffer_idx
+            };
+
+            /* De-interleave samples: [RX0_I, RX0_Q, RX1_I, RX1_Q, ...] -> separate buffers
+             * This is performance-critical, so we use direct pointer arithmetic */
+            int16_t *src = samples;
+            int16_t *dst_rx0 = buffer_rx0.data;
+            int16_t *dst_rx1 = buffer_rx1.data;
+
+            for (size_t i = 0; i < num_samples; i++) {
+                *dst_rx0++ = *src++;  /* RX0 I */
+                *dst_rx0++ = *src++;  /* RX0 Q */
+                *dst_rx1++ = *src++;  /* RX1 I */
+                *dst_rx1++ = *src++;  /* RX1 Q */
+            }
+
+            /* Push to both ring buffers */
+            bool rx0_ok = ring_buffer_push(&g_ring_buffer_rx0, &buffer_rx0);
+            bool rx1_ok = ring_buffer_push(&g_ring_buffer_rx1, &buffer_rx1);
+
+            if (!rx0_ok || !rx1_ok) {
+                g_stats.ring_buffer_drops++;
+            } else {
+                g_stats.dma_buffers_processed++;
+            }
+
         } else {
-            g_stats.dma_buffers_processed++;
+            /* Single-channel mode: 4 bytes per I/Q pair (RX0 or RX1) */
+            size_t num_samples = nbytes / 4;
+
+            /* Select appropriate ring buffer based on channel mode */
+            lock_free_ring_buffer_t *target_buffer =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? &g_ring_buffer_rx1 : &g_ring_buffer_rx0;
+            atomic_uint *seq_counter =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? &g_sequence_counter_rx1 : &g_sequence_counter_rx0;
+
+            /* Prepare ring buffer entry */
+            iq_buffer_entry_t buffer_entry = {
+                .data = target_buffer->sample_pool[buffer_idx],
+                .sample_count = num_samples,
+                .timestamp_us = timestamp_us,
+                .sequence_num = atomic_fetch_add(seq_counter, 1),
+                .buffer_id = buffer_idx
+            };
+
+            /* Fast memcpy - copy entire buffer at once */
+            memcpy(buffer_entry.data, samples, num_samples * 4);
+
+            /* Push to ring buffer (non-blocking) */
+            if (!ring_buffer_push(target_buffer, &buffer_entry)) {
+                g_stats.ring_buffer_drops++;
+                /* Ring buffer full - network thread may be overloaded */
+            } else {
+                g_stats.dma_buffers_processed++;
+            }
         }
 
         /* Rotate to next buffer in pool */
