@@ -664,30 +664,42 @@ class VITA49StreamServer:
 
 class VITA49StreamClient:
     """
-    VITA 49 IQ Stream Receiver Client
+    VITA 49 IQ Stream Receiver Client (Multi-Stream Support)
 
     Receives VRT packets over UDP and extracts IQ samples.
-    Useful for testing the streaming server.
+    Supports multiple concurrent streams demultiplexed by stream_id.
+
+    Features:
+    - Per-stream buffering and statistics
+    - Gap detection via packet_count tracking
+    - Sample loss flag monitoring from trailer
+    - Backward compatible single-stream access
     """
 
     def __init__(
         self,
         listen_address: str = "0.0.0.0",
         port: int = 4991,
-        buffer_size: int = 65536
+        buffer_size: int = 65536,
+        samples_per_stream: int = 1000000
     ):
         self.listen_address = listen_address
         self.port = port
         self.buffer_size = buffer_size
+        self.samples_per_stream = samples_per_stream
         self.socket: Optional[socket.socket] = None
         self._running = False
         self._receive_thread: Optional[threading.Thread] = None
 
-        # Received data
+        # Multi-stream support: stream_id -> buffers/stats
+        self.stream_buffers: Dict[int, deque] = {}  # stream_id -> deque of samples
+        self.stream_stats: Dict[int, Dict] = {}     # stream_id -> statistics dict
+        self.stream_contexts: Dict[int, VRTContextPacket] = {}  # stream_id -> last context
+
+        # Global stats (backward compatibility)
         self.packets_received = 0
         self.samples_received = 0
         self.last_context: Optional[VRTContextPacket] = None
-        self._sample_buffer: deque = deque(maxlen=1000000)  # ~1M samples
 
         # Callbacks
         self._on_samples: Optional[Callable] = None
@@ -724,7 +736,7 @@ class VITA49StreamClient:
             self.socket = None
 
     def _receive_loop(self):
-        """Background receive loop"""
+        """Background receive loop with multi-stream support"""
         while self._running:
             try:
                 data, addr = self.socket.recvfrom(self.buffer_size)
@@ -737,22 +749,71 @@ class VITA49StreamClient:
                     # Signal data packet
                     packet = VRTSignalDataPacket.decode(data)
                     iq_samples = packet.to_iq_samples()
+                    stream_id = packet.stream_id if packet.stream_id else 0x01000000
 
+                    # Initialize stream if first packet from this stream_id
+                    if stream_id not in self.stream_buffers:
+                        self.stream_buffers[stream_id] = deque(maxlen=self.samples_per_stream)
+                        self.stream_stats[stream_id] = {
+                            'packets_received': 0,
+                            'samples_received': 0,
+                            'gaps_detected': 0,
+                            'sample_loss_count': 0,
+                            'last_packet_count': None
+                        }
+                        logger.info(f"New stream detected: 0x{stream_id:08X}")
+
+                    # Update global stats (backward compatibility)
                     self.packets_received += 1
                     self.samples_received += len(iq_samples)
 
-                    # Store samples
-                    for s in iq_samples:
-                        self._sample_buffer.append(s)
+                    # Update per-stream stats
+                    stats = self.stream_stats[stream_id]
+                    stats['packets_received'] += 1
+                    stats['samples_received'] += len(iq_samples)
 
+                    # Gap detection: Check packet_count continuity (4-bit counter, wraps at 16)
+                    current_count = header.packet_count
+                    last_count = stats['last_packet_count']
+                    if last_count is not None:
+                        expected_count = (last_count + 1) % 16
+                        if current_count != expected_count:
+                            stats['gaps_detected'] += 1
+                            logger.warning(
+                                f"Stream 0x{stream_id:08X}: Packet gap detected "
+                                f"(expected count {expected_count}, got {current_count})"
+                            )
+                    stats['last_packet_count'] = current_count
+
+                    # Sample loss detection: Check trailer flag
+                    if packet.trailer and packet.trailer.sample_loss:
+                        stats['sample_loss_count'] += 1
+                        logger.warning(
+                            f"Stream 0x{stream_id:08X}: Sample loss flag set in packet trailer"
+                        )
+
+                    # Store samples in per-stream buffer
+                    buffer = self.stream_buffers[stream_id]
+                    for s in iq_samples:
+                        buffer.append(s)
+
+                    # Invoke callback with stream_id
                     if self._on_samples:
-                        self._on_samples(packet, iq_samples)
+                        self._on_samples(stream_id, packet, iq_samples)
 
                 elif header.packet_type == PacketType.CONTEXT:
-                    # Context packet - parse manually for now
-                    # (full context parsing would require more implementation)
+                    # Context packet
+                    packet = VRTContextPacket.decode(data)
+                    stream_id = packet.stream_id if packet.stream_id else 0x01000000
+
+                    # Store per-stream context
+                    self.stream_contexts[stream_id] = packet
+                    self.last_context = packet  # Backward compatibility
+
+                    logger.debug(f"Stream 0x{stream_id:08X}: Context packet received")
+
                     if self._on_context:
-                        self._on_context(data)
+                        self._on_context(stream_id, packet)
 
             except socket.timeout:
                 continue
@@ -760,19 +821,55 @@ class VITA49StreamClient:
                 if self._running:
                     logger.error(f"Receive error: {e}")
 
-    def get_samples(self, count: int) -> np.ndarray:
-        """Get samples from buffer"""
+    def get_samples(self, count: int, stream_id: Optional[int] = None) -> np.ndarray:
+        """
+        Get samples from buffer
+
+        Args:
+            count: Number of samples to retrieve
+            stream_id: Stream ID to get samples from (None = first available stream)
+
+        Returns:
+            numpy array of complex64 IQ samples
+        """
+        # If no stream_id specified, use first available stream (backward compatibility)
+        if stream_id is None:
+            if not self.stream_buffers:
+                return np.array([], dtype=np.complex64)
+            stream_id = next(iter(self.stream_buffers.keys()))
+
+        # Get samples from specified stream
+        if stream_id not in self.stream_buffers:
+            return np.array([], dtype=np.complex64)
+
+        buffer = self.stream_buffers[stream_id]
         samples = []
-        for _ in range(min(count, len(self._sample_buffer))):
-            samples.append(self._sample_buffer.popleft())
+        for _ in range(min(count, len(buffer))):
+            samples.append(buffer.popleft())
         return np.array(samples, dtype=np.complex64)
 
+    def get_stream_stats(self, stream_id: int) -> Optional[Dict]:
+        """Get statistics for a specific stream"""
+        return self.stream_stats.get(stream_id)
+
+    def get_all_streams(self) -> List[int]:
+        """Get list of all active stream IDs"""
+        return list(self.stream_buffers.keys())
+
     def on_samples(self, callback: Callable):
-        """Set callback for received samples: callback(packet, iq_samples)"""
+        """
+        Set callback for received samples
+
+        Callback signature: callback(stream_id, packet, iq_samples)
+        """
         self._on_samples = callback
 
     def on_context(self, callback: Callable):
-        """Set callback for context packets: callback(raw_data)"""
+        """
+        Set callback for context packets
+
+        Callback signature: callback(stream_id, context_packet)
+        """
         self._on_context = callback
 
 
