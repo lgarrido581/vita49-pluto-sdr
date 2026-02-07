@@ -211,8 +211,8 @@ static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len);
 static uint64_t get_timestamp_us(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
 
-static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id);
-static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us, uint32_t stream_id);
+static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id, bool sample_loss);
+static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us, uint32_t stream_id, bool sample_loss);
 /* Multicore optimization thread functions */
 static void *dma_reader_thread(void *arg);     /* Core 0: DMA reader (producer) */
 static void *network_thread(void *arg);        /* Core 1: Network TX + Config (consumer) */
@@ -508,7 +508,7 @@ static int batch_flush_to_all_subscribers(int sock, packet_batch_t *batch) {
 }
 
 /* Encode VITA49 Context packet */
-static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id) {
+static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id, bool sample_loss) {
     vrt_context_header_t *hdr = (vrt_context_header_t *)buf;
     uint8_t *payload = buf + sizeof(vrt_context_header_t);
     size_t payload_len = 0;
@@ -525,9 +525,9 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id)
     uint32_t ts_int = ts_us / 1000000;
     uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;  /* Convert to picoseconds */
 
-    /* Health status indicators (not tracked in simplified stats) */
-    uint64_t underflows = 0;
-    uint64_t overflows = 0;
+    /* Health status indicators */
+    uint64_t underflows = sample_loss ? 1 : 0;  /* Indicate sample loss if detected */
+    uint64_t overflows = 0;  /* Not currently tracked */
 
     /* Context Indicator Field (CIF) */
     uint32_t cif = 0;
@@ -625,7 +625,8 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id)
  */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count,
-                               uint64_t timestamp_us, uint32_t stream_id) {
+                               uint64_t timestamp_us, uint32_t stream_id,
+                               bool sample_loss) {
     if (num_samples == 0) {
         *len = 0;
         return;
@@ -656,7 +657,11 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
 
     /* Trailer */
     uint32_t *trailer = (uint32_t *)(payload + payload_bytes);
-    *trailer = htonl_custom(0x40000000);  /* valid_data = 1 */
+    uint32_t trailer_val = 0x40000000;  /* valid_data = 1 (bit 30) */
+    if (sample_loss) {
+        trailer_val |= (1 << 24);  /* sample_loss = 1 (bit 24) */
+    }
+    *trailer = htonl_custom(trailer_val);
 
     /* Calculate packet size */
     size_t total_words = 1 + 1 + 1 + 2 + (payload_bytes / 4) + 1;
@@ -1000,6 +1005,12 @@ static void *network_thread(void *arg) {
     int packets_since_context_rx1 = 0;
     uint64_t total_packets_sent = 0;
 
+    /* Sample loss detection: track last sequence numbers */
+    uint32_t last_sequence_rx0 = UINT32_MAX;  /* Init to max so first packet doesn't trigger loss */
+    uint32_t last_sequence_rx1 = UINT32_MAX;
+    bool sample_loss_rx0 = false;
+    bool sample_loss_rx1 = false;
+
     printf("[Network Thread] Using sendmmsg() batching: %d packets/syscall\n", SEND_BATCH_SIZE);
 
     while (g_running) {
@@ -1059,7 +1070,7 @@ static void *network_thread(void *arg) {
                 add_subscriber(&client_addr);
                 
                 /* Send immediate context packet response */
-                encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0);
+                encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0, false);
                 sendto(data_sock, context_buf, context_packet_len, 0,
                       (struct sockaddr *)&client_addr, sizeof(client_addr));
                 g_stats.contexts_sent++;
@@ -1080,6 +1091,36 @@ static void *network_thread(void *arg) {
             iq_buffer_entry_t iq_rx0, iq_rx1;
             bool has_rx0 = ring_buffer_pop(&g_ring_buffer_rx0, &iq_rx0);
             bool has_rx1 = ring_buffer_pop(&g_ring_buffer_rx1, &iq_rx1);
+
+            /* Detect sequence gaps for sample loss indication */
+            sample_loss_rx0 = false;
+            sample_loss_rx1 = false;
+
+            if (has_rx0) {
+                if (last_sequence_rx0 != UINT32_MAX) {
+                    uint32_t expected = last_sequence_rx0 + 1;
+                    if (iq_rx0.sequence_num != expected) {
+                        sample_loss_rx0 = true;
+                        uint32_t gap = iq_rx0.sequence_num - expected;
+                        printf("[Network Thread] RX0 sample loss: gap of %u buffers (seq %u -> %u)\n",
+                               gap, last_sequence_rx0, iq_rx0.sequence_num);
+                    }
+                }
+                last_sequence_rx0 = iq_rx0.sequence_num;
+            }
+
+            if (has_rx1) {
+                if (last_sequence_rx1 != UINT32_MAX) {
+                    uint32_t expected = last_sequence_rx1 + 1;
+                    if (iq_rx1.sequence_num != expected) {
+                        sample_loss_rx1 = true;
+                        uint32_t gap = iq_rx1.sequence_num - expected;
+                        printf("[Network Thread] RX1 sample loss: gap of %u buffers (seq %u -> %u)\n",
+                               gap, last_sequence_rx1, iq_rx1.sequence_num);
+                    }
+                }
+                last_sequence_rx1 = iq_rx1.sequence_num;
+            }
 
             if (has_rx0 || has_rx1) {
                 batch_init(batch);
@@ -1108,7 +1149,8 @@ static void *network_thread(void *arg) {
                                          samples_this_packet,
                                          &packet_count_rx0,
                                          iq_rx0.timestamp_us,
-                                         STREAM_ID_RX0);
+                                         STREAM_ID_RX0,
+                                         sample_loss_rx0);
 
                         batch_commit_packet(batch, packet_len);
                         packets_this_iteration++;
@@ -1122,10 +1164,11 @@ static void *network_thread(void *arg) {
                                 batch_flush_to_all_subscribers(data_sock, batch);
                                 batch_init(batch);
                             }
-                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0);
+                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0, sample_loss_rx0);
                             broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
                             g_stats.contexts_sent++;
                             packets_since_context_rx0 = 0;
+                            sample_loss_rx0 = false;  /* Reset after reporting */
                         }
 
                         if (batch->count >= SEND_BATCH_SIZE) {
@@ -1146,7 +1189,8 @@ static void *network_thread(void *arg) {
                                          samples_this_packet,
                                          &packet_count_rx1,
                                          iq_rx1.timestamp_us,
-                                         STREAM_ID_RX1);
+                                         STREAM_ID_RX1,
+                                         sample_loss_rx1);
 
                         batch_commit_packet(batch, packet_len);
                         packets_this_iteration++;
@@ -1160,10 +1204,11 @@ static void *network_thread(void *arg) {
                                 batch_flush_to_all_subscribers(data_sock, batch);
                                 batch_init(batch);
                             }
-                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX1);
+                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX1, sample_loss_rx1);
                             broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
                             g_stats.contexts_sent++;
                             packets_since_context_rx1 = 0;
+                            sample_loss_rx1 = false;  /* Reset after reporting */
                         }
 
                         if (batch->count >= SEND_BATCH_SIZE) {
@@ -1201,9 +1246,26 @@ static void *network_thread(void *arg) {
                 (mode == CHANNEL_MODE_SINGLE_RX1) ? &packets_since_context_rx1 : &packets_since_context_rx0;
             uint32_t stream_id =
                 (mode == CHANNEL_MODE_SINGLE_RX1) ? STREAM_ID_RX1 : STREAM_ID_RX0;
+            uint32_t *last_sequence =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? &last_sequence_rx1 : &last_sequence_rx0;
+            bool *sample_loss_flag =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? &sample_loss_rx1 : &sample_loss_rx0;
 
             iq_buffer_entry_t iq_buffer;
             if (ring_buffer_pop(source_buffer, &iq_buffer)) {
+                /* Detect sequence gaps for sample loss indication */
+                *sample_loss_flag = false;
+                if (*last_sequence != UINT32_MAX) {
+                    uint32_t expected = *last_sequence + 1;
+                    if (iq_buffer.sequence_num != expected) {
+                        *sample_loss_flag = true;
+                        uint32_t gap = iq_buffer.sequence_num - expected;
+                        const char *channel_name = (mode == CHANNEL_MODE_SINGLE_RX1) ? "RX1" : "RX0";
+                        printf("[Network Thread] %s sample loss: gap of %u buffers (seq %u -> %u)\n",
+                               channel_name, gap, *last_sequence, iq_buffer.sequence_num);
+                    }
+                }
+                *last_sequence = iq_buffer.sequence_num;
                 /* Process entire IQ buffer into VITA49 packets */
                 batch_init(batch);
                 size_t packets_this_buffer = 0;
@@ -1221,7 +1283,8 @@ static void *network_thread(void *arg) {
                                      samples_this_packet,
                                      packet_counter,
                                      iq_buffer.timestamp_us,
-                                     stream_id);
+                                     stream_id,
+                                     *sample_loss_flag);
 
                     batch_commit_packet(batch, packet_len);
                     packets_this_buffer++;
@@ -1235,10 +1298,11 @@ static void *network_thread(void *arg) {
                             batch_init(batch);
                         }
 
-                        encode_context_packet(context_buf, &context_packet_len, stream_id);
+                        encode_context_packet(context_buf, &context_packet_len, stream_id, *sample_loss_flag);
                         broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
                         g_stats.contexts_sent++;
                         *context_counter = 0;
+                        *sample_loss_flag = false;  /* Reset after reporting */
                     }
 
                     if (batch->count >= SEND_BATCH_SIZE) {
