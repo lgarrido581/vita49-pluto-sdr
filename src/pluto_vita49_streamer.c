@@ -690,7 +690,8 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
 
 /* Parse VITA49 Context packet and extract configuration */
 static int parse_context_packet(const uint8_t *buf, size_t len,
-                                uint64_t *freq_hz, uint32_t *rate_hz, double *gain_db) {
+                                uint64_t *freq_hz, uint32_t *rate_hz, double *gain_db,
+                                channel_mode_t *channel_mode) {
     if (len < 28) return -1;  /* Minimum context packet size */
 
     /* Skip VRT header (4 bytes) and stream ID (4 bytes) */
@@ -736,6 +737,19 @@ static int parse_context_packet(const uint8_t *buf, size_t len,
         int64_t rate_fixed = ((int64_t)high << 32) | (int64_t)low;
         *rate_hz = (uint32_t)(rate_fixed / (1 << 20));  /* Divide by 2^20 */
         p += 8;
+    }
+
+    /* Bit 16: Channel Mode (custom extension for dual-channel support) */
+    if (cif & (1 << 16)) {
+        /* Read 32-bit field: 1 byte channel_mode + 3 bytes padding */
+        uint32_t mode_field = ntohl(*(uint32_t *)p);
+        uint8_t mode = (mode_field >> 24) & 0xFF;  /* Extract high byte */
+
+        /* Validate and set channel mode */
+        if (mode <= CHANNEL_MODE_DUAL) {
+            *channel_mode = (channel_mode_t)mode;
+        }
+        p += 4;
     }
 
     return 0;
@@ -1033,33 +1047,43 @@ static void *network_thread(void *arg) {
             uint64_t new_freq = g_sdr_config.center_freq_hz;
             uint32_t new_rate = g_sdr_config.sample_rate_hz;
             double new_gain = g_sdr_config.gain_db;
-            
-            if (parse_context_packet(config_buf, config_recv, &new_freq, &new_rate, &new_gain) == 0) {
+            channel_mode_t new_channel_mode = g_sdr_config.channel_mode;
+
+            if (parse_context_packet(config_buf, config_recv, &new_freq, &new_rate, &new_gain, &new_channel_mode) == 0) {
                 bool changed = false;
-                
+
                 pthread_mutex_lock(&g_sdr_config.mutex);
-                
+
                 if (new_freq != g_sdr_config.center_freq_hz) {
                     printf("[Network Thread] Freq: %.3f -> %.3f MHz\n",
                            g_sdr_config.center_freq_hz / 1e6, new_freq / 1e6);
                     g_sdr_config.center_freq_hz = new_freq;
                     changed = true;
                 }
-                
+
                 if (new_rate != g_sdr_config.sample_rate_hz) {
                     printf("[Network Thread] Rate: %.1f -> %.1f MSPS\n",
                            g_sdr_config.sample_rate_hz / 1e6, new_rate / 1e6);
                     g_sdr_config.sample_rate_hz = new_rate;
                     changed = true;
                 }
-                
+
                 if (fabs(new_gain - g_sdr_config.gain_db) > 0.1) {
                     printf("[Network Thread] Gain: %.1f -> %.1f dB\n",
                            g_sdr_config.gain_db, new_gain);
                     g_sdr_config.gain_db = new_gain;
                     changed = true;
                 }
-                
+
+                if (new_channel_mode != g_sdr_config.channel_mode) {
+                    const char *mode_names[] = {"RX0", "RX1", "DUAL"};
+                    printf("[Network Thread] Channel Mode: %s -> %s\n",
+                           mode_names[g_sdr_config.channel_mode],
+                           mode_names[new_channel_mode]);
+                    g_sdr_config.channel_mode = new_channel_mode;
+                    changed = true;
+                }
+
                 if (changed) {
                     g_sdr_config.config_changed = true;
                 }
