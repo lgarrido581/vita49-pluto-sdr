@@ -91,9 +91,14 @@ static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime based on MTU */
 
-/* Multicore optimization: Global ring buffer for IQ data transfer */
-static lock_free_ring_buffer_t g_ring_buffer;
-static atomic_uint g_sequence_counter = ATOMIC_VAR_INIT(0);
+/* Multicore optimization: Global ring buffers for IQ data transfer
+ * - RX0 buffer used for single-channel mode (backward compatible)
+ * - RX1 buffer used only in dual-channel mode
+ */
+static lock_free_ring_buffer_t g_ring_buffer_rx0_rx0;
+static lock_free_ring_buffer_t g_ring_buffer_rx0_rx1;
+static atomic_uint g_sequence_counter_rx0_rx0 = ATOMIC_VAR_INIT(0);
+static atomic_uint g_sequence_counter_rx0_rx1 = ATOMIC_VAR_INIT(0);
 
 /* Thread argument structure for network thread (Phase 3) */
 typedef struct {
@@ -120,12 +125,20 @@ typedef struct {
 static subscriber_t g_subscribers[MAX_SUBSCRIBERS];
 static int g_subscriber_count = 0;
 
+/* Channel Mode Configuration */
+typedef enum {
+    CHANNEL_MODE_SINGLE_RX0 = 0x00,  /* RX0 only (default, backward compatible) */
+    CHANNEL_MODE_SINGLE_RX1 = 0x01,  /* RX1 only */
+    CHANNEL_MODE_DUAL = 0x02         /* RX0 + RX1 simultaneously */
+} channel_mode_t;
+
 /* SDR Configuration */
 typedef struct {
     uint64_t center_freq_hz;
     uint32_t sample_rate_hz;
     uint32_t bandwidth_hz;
     double gain_db;
+    channel_mode_t channel_mode;  /* Channel selection mode */
     bool config_changed;  /* Flag to signal streaming thread to reconfigure */
     pthread_mutex_t mutex;
 } sdr_config_t;
@@ -135,6 +148,7 @@ static sdr_config_t g_sdr_config = {
     .sample_rate_hz = DEFAULT_RATE_HZ,
     .bandwidth_hz = DEFAULT_RATE_HZ * 0.8,
     .gain_db = DEFAULT_GAIN_DB,
+    .channel_mode = CHANNEL_MODE_SINGLE_RX0,  /* Default: single channel RX0 for backward compatibility */
     .config_changed = false,
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
@@ -838,10 +852,10 @@ static void *dma_reader_thread(void *arg) {
 
         /* Prepare ring buffer entry */
         iq_buffer_entry_t buffer_entry = {
-            .data = g_ring_buffer.sample_pool[buffer_idx],
+            .data = g_ring_buffer_rx0.sample_pool[buffer_idx],
             .sample_count = num_samples,
             .timestamp_us = get_timestamp_us(),
-            .sequence_num = atomic_fetch_add(&g_sequence_counter, 1),
+            .sequence_num = atomic_fetch_add(&g_sequence_counter_rx0, 1),
             .buffer_id = buffer_idx
         };
 
@@ -849,7 +863,7 @@ static void *dma_reader_thread(void *arg) {
         memcpy(buffer_entry.data, samples, num_samples * 4);
 
         /* Push to ring buffer (non-blocking) */
-        if (!ring_buffer_push(&g_ring_buffer, &buffer_entry)) {
+        if (!ring_buffer_push(&g_ring_buffer_rx0, &buffer_entry)) {
             g_stats.ring_buffer_drops++;
             /* Ring buffer full - network thread may be overloaded */
         } else {
@@ -990,7 +1004,7 @@ static void *network_thread(void *arg) {
         
         /* 2. Consume IQ data from ring buffer and transmit */
         iq_buffer_entry_t iq_buffer;
-        if (ring_buffer_pop(&g_ring_buffer, &iq_buffer)) {
+        if (ring_buffer_pop(&g_ring_buffer_rx0, &iq_buffer)) {
             /* Process entire IQ buffer into VITA49 packets */
             batch_init(batch);
             size_t packets_this_buffer = 0;
@@ -1083,17 +1097,22 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
     uint32_t target_rate = g_sdr_config.sample_rate_hz;
     uint32_t target_bw = g_sdr_config.bandwidth_hz;
     double target_gain = g_sdr_config.gain_db;
+    channel_mode_t target_channel_mode = g_sdr_config.channel_mode;
     pthread_mutex_unlock(&g_sdr_config.mutex);
 
     char buf[64];
     ssize_t ret;
 
-    /* First, disable DMA channels before changing sample rate */
+    /* First, disable all DMA channels before changing sample rate */
     struct iio_channel *rx0_i = iio_device_find_channel(dev, "voltage0", false);
     struct iio_channel *rx0_q = iio_device_find_channel(dev, "voltage1", false);
+    struct iio_channel *rx1_i = iio_device_find_channel(dev, "voltage2", false);
+    struct iio_channel *rx1_q = iio_device_find_channel(dev, "voltage3", false);
 
     if (rx0_i) iio_channel_disable(rx0_i);
     if (rx0_q) iio_channel_disable(rx0_q);
+    if (rx1_i) iio_channel_disable(rx1_i);
+    if (rx1_q) iio_channel_disable(rx1_q);
 
     /* Set RX LO frequency */
     struct iio_channel *lo_ch = iio_device_find_channel(phy, "altvoltage0", true);
@@ -1148,14 +1167,23 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
     /* Small delay to let AD9361 PLLs settle after rate change */
     usleep(10000);  /* 10ms */
 
-    /* Re-enable DMA channels for buffer creation */
-    if (rx0_i) iio_channel_enable(rx0_i);
-    if (rx0_q) iio_channel_enable(rx0_q);
+    /* Re-enable DMA channels for buffer creation based on channel mode */
+    if (target_channel_mode == CHANNEL_MODE_SINGLE_RX0 || target_channel_mode == CHANNEL_MODE_DUAL) {
+        if (rx0_i) iio_channel_enable(rx0_i);
+        if (rx0_q) iio_channel_enable(rx0_q);
+    }
+    if (target_channel_mode == CHANNEL_MODE_SINGLE_RX1 || target_channel_mode == CHANNEL_MODE_DUAL) {
+        if (rx1_i) iio_channel_enable(rx1_i);
+        if (rx1_q) iio_channel_enable(rx1_q);
+    }
 
-    printf("[Config] Configured: %.1f MHz, %.1f MSPS, %.1f dB\n",
+    const char *mode_str = (target_channel_mode == CHANNEL_MODE_DUAL) ? "DUAL (RX0+RX1)" :
+                           (target_channel_mode == CHANNEL_MODE_SINGLE_RX1) ? "RX1" : "RX0";
+    printf("[Config] Configured: %.1f MHz, %.1f MSPS, %.1f dB, Mode: %s\n",
            target_freq / 1e6,
            target_rate / 1e6,
-           target_gain);
+           target_gain,
+           mode_str);
 
     return 0;
 }
@@ -1248,10 +1276,12 @@ int main(int argc, char **argv) {
 
     printf("Control: %d, Data: %d\n\n", CONTROL_PORT, DATA_PORT);
 
-    /* Initialize ring buffer for multicore optimization */
-    ring_buffer_init(&g_ring_buffer);
-    printf("Ring buffer initialized: %d entries, %zu MB\n", 
-           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer) / (1024*1024));
+    /* Initialize ring buffers for multicore optimization */
+    ring_buffer_init(&g_ring_buffer_rx0_rx0);
+    ring_buffer_init(&g_ring_buffer_rx0_rx1);
+    printf("Ring buffers initialized: RX0=%d entries (%zu MB), RX1=%d entries (%zu MB)\n",
+           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer_rx0_rx0) / (1024*1024),
+           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer_rx0_rx1) / (1024*1024));
 
     /* Start multicore optimized threads - Phase 3: Full dual-core utilization */
     pthread_t dma_tid, network_tid;
@@ -1285,7 +1315,7 @@ int main(int argc, char **argv) {
                mbps, g_subscriber_count);
 
         /* Phase 3: Full dual-core performance stats */
-        ring_buffer_stats_t rb_stats = ring_buffer_get_stats(&g_ring_buffer);
+        ring_buffer_stats_t rb_stats = ring_buffer_get_stats(&g_ring_buffer_rx0);
         printf("[Core 0] DMA: %llu bufs processed, Ring pushes: %.1f%% success\n",
                (unsigned long long)g_stats.dma_buffers_processed,
                rb_stats.push_success_rate * 100.0);
