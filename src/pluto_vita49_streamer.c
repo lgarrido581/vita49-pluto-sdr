@@ -994,8 +994,10 @@ static void *network_thread(void *arg) {
 
     uint8_t context_buf[2048];  /* For immediate context packet transmission */
     size_t context_packet_len;
-    uint8_t packet_count = 0;
-    int packets_since_context = 0;
+    uint8_t packet_count_rx0 = 0;  /* Separate packet counter for RX0 channel */
+    uint8_t packet_count_rx1 = 0;  /* Separate packet counter for RX1 channel */
+    int packets_since_context_rx0 = 0;
+    int packets_since_context_rx1 = 0;
     uint64_t total_packets_sent = 0;
 
     printf("[Network Thread] Using sendmmsg() batching: %d packets/syscall\n", SEND_BATCH_SIZE);
@@ -1066,75 +1068,203 @@ static void *network_thread(void *arg) {
             }
         }
         
-        /* 2. Consume IQ data from ring buffer and transmit */
-        iq_buffer_entry_t iq_buffer;
-        if (ring_buffer_pop(&g_ring_buffer_rx0, &iq_buffer)) {
-            /* Process entire IQ buffer into VITA49 packets */
-            batch_init(batch);
-            size_t packets_this_buffer = 0;
-            size_t bytes_this_buffer = 0;
-            
-            for (size_t offset = 0; offset < iq_buffer.sample_count; offset += g_samples_per_packet) {
-                size_t samples_this_packet = MIN(g_samples_per_packet, 
-                                                iq_buffer.sample_count - offset);
-                
-                /* Get buffer for this packet */
-                uint8_t *packet_buf = batch_get_buffer(batch);
-                size_t packet_len;
-                
-                /* Encode VITA49 data packet */
-                encode_data_packet(packet_buf, &packet_len,
-                                 iq_buffer.data + (offset * 2),  /* I/Q pairs */
-                                 samples_this_packet,
-                                 &packet_count,
-                                 iq_buffer.timestamp_us,
-                                 STREAM_ID_RX0);
-                
-                batch_commit_packet(batch, packet_len);
-                packets_this_buffer++;
-                bytes_this_buffer += packet_len;
-                
-                /* Send context packet periodically */
-                packets_since_context++;
-                if (packets_since_context >= CONTEXT_INTERVAL) {
-                    /* Flush current batch first */
-                    if (batch->count > 0) {
-                        batch_flush_to_all_subscribers(data_sock, batch);
-                        batch_init(batch);
-                    }
-                    
-                    /* Send context packet immediately */
-                    encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0);
-                    broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
-                    g_stats.contexts_sent++;
-                    packets_since_context = 0;
+        /* 2. Consume IQ data from ring buffer(s) and transmit */
+
+        /* Read channel mode to determine single vs dual-channel */
+        pthread_mutex_lock(&g_sdr_config.mutex);
+        channel_mode_t mode = g_sdr_config.channel_mode;
+        pthread_mutex_unlock(&g_sdr_config.mutex);
+
+        if (mode == CHANNEL_MODE_DUAL) {
+            /* Dual-channel mode: Pop from both buffers and alternate packets */
+            iq_buffer_entry_t iq_rx0, iq_rx1;
+            bool has_rx0 = ring_buffer_pop(&g_ring_buffer_rx0, &iq_rx0);
+            bool has_rx1 = ring_buffer_pop(&g_ring_buffer_rx1, &iq_rx1);
+
+            if (has_rx0 || has_rx1) {
+                batch_init(batch);
+                size_t packets_this_iteration = 0;
+                size_t bytes_this_iteration = 0;
+
+                /* Process both channels in an alternating pattern for lowest latency */
+                size_t max_samples = has_rx0 ? iq_rx0.sample_count : 0;
+                if (has_rx1 && iq_rx1.sample_count > max_samples) {
+                    max_samples = iq_rx1.sample_count;
                 }
-                
-                /* Flush batch when full */
-                if (batch->count >= SEND_BATCH_SIZE) {
+
+                size_t offset_rx0 = 0, offset_rx1 = 0;
+                while ((has_rx0 && offset_rx0 < iq_rx0.sample_count) ||
+                       (has_rx1 && offset_rx1 < iq_rx1.sample_count)) {
+
+                    /* Send RX0 packet if available */
+                    if (has_rx0 && offset_rx0 < iq_rx0.sample_count) {
+                        size_t samples_this_packet = MIN(g_samples_per_packet,
+                                                        iq_rx0.sample_count - offset_rx0);
+                        uint8_t *packet_buf = batch_get_buffer(batch);
+                        size_t packet_len;
+
+                        encode_data_packet(packet_buf, &packet_len,
+                                         iq_rx0.data + (offset_rx0 * 2),
+                                         samples_this_packet,
+                                         &packet_count_rx0,
+                                         iq_rx0.timestamp_us,
+                                         STREAM_ID_RX0);
+
+                        batch_commit_packet(batch, packet_len);
+                        packets_this_iteration++;
+                        bytes_this_iteration += packet_len;
+                        offset_rx0 += samples_this_packet;
+
+                        /* Context packet for RX0 */
+                        packets_since_context_rx0++;
+                        if (packets_since_context_rx0 >= CONTEXT_INTERVAL) {
+                            if (batch->count > 0) {
+                                batch_flush_to_all_subscribers(data_sock, batch);
+                                batch_init(batch);
+                            }
+                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0);
+                            broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
+                            g_stats.contexts_sent++;
+                            packets_since_context_rx0 = 0;
+                        }
+
+                        if (batch->count >= SEND_BATCH_SIZE) {
+                            batch_flush_to_all_subscribers(data_sock, batch);
+                            batch_init(batch);
+                        }
+                    }
+
+                    /* Send RX1 packet if available (alternate for low latency) */
+                    if (has_rx1 && offset_rx1 < iq_rx1.sample_count) {
+                        size_t samples_this_packet = MIN(g_samples_per_packet,
+                                                        iq_rx1.sample_count - offset_rx1);
+                        uint8_t *packet_buf = batch_get_buffer(batch);
+                        size_t packet_len;
+
+                        encode_data_packet(packet_buf, &packet_len,
+                                         iq_rx1.data + (offset_rx1 * 2),
+                                         samples_this_packet,
+                                         &packet_count_rx1,
+                                         iq_rx1.timestamp_us,
+                                         STREAM_ID_RX1);
+
+                        batch_commit_packet(batch, packet_len);
+                        packets_this_iteration++;
+                        bytes_this_iteration += packet_len;
+                        offset_rx1 += samples_this_packet;
+
+                        /* Context packet for RX1 */
+                        packets_since_context_rx1++;
+                        if (packets_since_context_rx1 >= CONTEXT_INTERVAL) {
+                            if (batch->count > 0) {
+                                batch_flush_to_all_subscribers(data_sock, batch);
+                                batch_init(batch);
+                            }
+                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX1);
+                            broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
+                            g_stats.contexts_sent++;
+                            packets_since_context_rx1 = 0;
+                        }
+
+                        if (batch->count >= SEND_BATCH_SIZE) {
+                            batch_flush_to_all_subscribers(data_sock, batch);
+                            batch_init(batch);
+                        }
+                    }
+                }
+
+                /* Flush remaining packets */
+                if (batch->count > 0) {
                     batch_flush_to_all_subscribers(data_sock, batch);
                     batch_init(batch);
                 }
+
+                /* Update statistics */
+                g_stats.network_thread_processed++;
+                g_stats.packets_sent += packets_this_iteration;
+                g_stats.bytes_sent += bytes_this_iteration;
+                total_packets_sent += packets_this_iteration;
+
+                if (total_packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0) {
+                    cleanup_dead_subscribers();
+                }
+
+                work_done = true;
             }
-            
-            /* Flush any remaining packets from this buffer */
-            if (batch->count > 0) {
-                batch_flush_to_all_subscribers(data_sock, batch);
+        } else {
+            /* Single-channel mode (RX0 or RX1) */
+            lock_free_ring_buffer_t *source_buffer =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? &g_ring_buffer_rx1 : &g_ring_buffer_rx0;
+            uint8_t *packet_counter =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? &packet_count_rx1 : &packet_count_rx0;
+            int *context_counter =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? &packets_since_context_rx1 : &packets_since_context_rx0;
+            uint32_t stream_id =
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? STREAM_ID_RX1 : STREAM_ID_RX0;
+
+            iq_buffer_entry_t iq_buffer;
+            if (ring_buffer_pop(source_buffer, &iq_buffer)) {
+                /* Process entire IQ buffer into VITA49 packets */
                 batch_init(batch);
+                size_t packets_this_buffer = 0;
+                size_t bytes_this_buffer = 0;
+
+                for (size_t offset = 0; offset < iq_buffer.sample_count; offset += g_samples_per_packet) {
+                    size_t samples_this_packet = MIN(g_samples_per_packet,
+                                                    iq_buffer.sample_count - offset);
+
+                    uint8_t *packet_buf = batch_get_buffer(batch);
+                    size_t packet_len;
+
+                    encode_data_packet(packet_buf, &packet_len,
+                                     iq_buffer.data + (offset * 2),
+                                     samples_this_packet,
+                                     packet_counter,
+                                     iq_buffer.timestamp_us,
+                                     stream_id);
+
+                    batch_commit_packet(batch, packet_len);
+                    packets_this_buffer++;
+                    bytes_this_buffer += packet_len;
+
+                    /* Send context packet periodically */
+                    (*context_counter)++;
+                    if (*context_counter >= CONTEXT_INTERVAL) {
+                        if (batch->count > 0) {
+                            batch_flush_to_all_subscribers(data_sock, batch);
+                            batch_init(batch);
+                        }
+
+                        encode_context_packet(context_buf, &context_packet_len, stream_id);
+                        broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
+                        g_stats.contexts_sent++;
+                        *context_counter = 0;
+                    }
+
+                    if (batch->count >= SEND_BATCH_SIZE) {
+                        batch_flush_to_all_subscribers(data_sock, batch);
+                        batch_init(batch);
+                    }
+                }
+
+                /* Flush any remaining packets */
+                if (batch->count > 0) {
+                    batch_flush_to_all_subscribers(data_sock, batch);
+                    batch_init(batch);
+                }
+
+                /* Update statistics */
+                g_stats.network_thread_processed++;
+                g_stats.packets_sent += packets_this_buffer;
+                g_stats.bytes_sent += bytes_this_buffer;
+                total_packets_sent += packets_this_buffer;
+
+                if (total_packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0) {
+                    cleanup_dead_subscribers();
+                }
+
+                work_done = true;
             }
-            
-            /* Update statistics */
-            g_stats.network_thread_processed++;
-            g_stats.packets_sent += packets_this_buffer;
-            g_stats.bytes_sent += bytes_this_buffer;
-            total_packets_sent += packets_this_buffer;
-            
-            /* Periodic subscriber cleanup */
-            if (total_packets_sent % SUBSCRIBER_CLEANUP_INTERVAL == 0) {
-                cleanup_dead_subscribers();
-            }
-            
-            work_done = true;
         }
         
         /* 3. Brief sleep only if no work was done */
