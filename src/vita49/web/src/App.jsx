@@ -32,12 +32,20 @@ function App() {
   // Track page visibility to prevent buffering when tab is not active
   useEffect(() => {
     const handleVisibilityChange = () => {
-      setIsPageVisible(!document.hidden)
+      const wasVisible = isPageVisible
+      const nowVisible = !document.hidden
+      setIsPageVisible(nowVisible)
+
+      if (!wasVisible && nowVisible) {
+        console.log('👁️ App: Page became visible, state updates will resume')
+      } else if (wasVisible && !nowVisible) {
+        console.log('🔒 App: Page became hidden, state updates paused')
+      }
     }
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-  }, [])
+  }, [isPageVisible])
 
   // Register WebSocket message handlers
   useEffect(() => {
@@ -57,6 +65,8 @@ function App() {
         // Only update spectrum when page is visible to prevent buffering
         if (isPageVisible) {
           setSpectrumData(data)
+        } else {
+          console.debug('🚫 App: Skipping spectrum update (page hidden)')
         }
       }),
       ws.on('waterfall', (data, metadata) => {
@@ -66,6 +76,8 @@ function App() {
         // Only update waterfall when page is visible to prevent buffering
         if (isPageVisible) {
           setWaterfallData(data)
+        } else {
+          console.debug('🚫 App: Skipping waterfall update (page hidden)')
         }
       })
     ]
