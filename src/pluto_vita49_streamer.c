@@ -86,6 +86,10 @@
 #define VRT_TSI_UTC             0x1             /* UTC timestamp */
 #define VRT_TSF_PICOSECONDS     0x2             /* Picosecond fractional time */
 
+/* VITA49 Stream IDs - format: device_id(8) | data_type(8) | reserved(8) | channel(8) */
+#define STREAM_ID_RX0           0x01000001      /* Device 1, Channel 1 (RX0) */
+#define STREAM_ID_RX1           0x01000002      /* Device 1, Channel 2 (RX1) */
+
 /* Global state */
 static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -95,10 +99,10 @@ static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime base
  * - RX0 buffer used for single-channel mode (backward compatible)
  * - RX1 buffer used only in dual-channel mode
  */
-static lock_free_ring_buffer_t g_ring_buffer_rx0_rx0;
-static lock_free_ring_buffer_t g_ring_buffer_rx0_rx1;
-static atomic_uint g_sequence_counter_rx0_rx0 = ATOMIC_VAR_INIT(0);
-static atomic_uint g_sequence_counter_rx0_rx1 = ATOMIC_VAR_INIT(0);
+static lock_free_ring_buffer_t g_ring_buffer_rx0;
+static lock_free_ring_buffer_t g_ring_buffer_rx1;
+static atomic_uint g_sequence_counter_rx0 = ATOMIC_VAR_INIT(0);
+static atomic_uint g_sequence_counter_rx1 = ATOMIC_VAR_INIT(0);
 
 /* Thread argument structure for network thread (Phase 3) */
 typedef struct {
@@ -207,8 +211,8 @@ static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len);
 static uint64_t get_timestamp_us(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
 
-static void encode_context_packet(uint8_t *buf, size_t *len);
-static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us);
+static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id);
+static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us, uint32_t stream_id);
 /* Multicore optimization thread functions */
 static void *dma_reader_thread(void *arg);     /* Core 0: DMA reader (producer) */
 static void *network_thread(void *arg);        /* Core 1: Network TX + Config (consumer) */
@@ -504,7 +508,7 @@ static int batch_flush_to_all_subscribers(int sock, packet_batch_t *batch) {
 }
 
 /* Encode VITA49 Context packet */
-static void encode_context_packet(uint8_t *buf, size_t *len) {
+static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id) {
     vrt_context_header_t *hdr = (vrt_context_header_t *)buf;
     uint8_t *payload = buf + sizeof(vrt_context_header_t);
     size_t payload_len = 0;
@@ -608,7 +612,7 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     header |= (total_words & 0xFFFF);
 
     hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(0x01000000);
+    hdr->stream_id = htonl_custom(stream_id);
     hdr->timestamp_int = htonl_custom(ts_int);
     hdr->timestamp_frac = htonll(ts_frac);
     hdr->cif = htonl_custom(cif);
@@ -621,7 +625,7 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
  */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count,
-                               uint64_t timestamp_us) {
+                               uint64_t timestamp_us, uint32_t stream_id) {
     if (num_samples == 0) {
         *len = 0;
         return;
@@ -671,7 +675,7 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
     header |= (total_words & 0xFFFF);
 
     hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(0x01000000);
+    hdr->stream_id = htonl_custom(stream_id);
     hdr->timestamp_int = htonl_custom(ts_int);
     hdr->timestamp_frac = htonll(ts_frac);
 
@@ -1053,7 +1057,7 @@ static void *network_thread(void *arg) {
                 add_subscriber(&client_addr);
                 
                 /* Send immediate context packet response */
-                encode_context_packet(context_buf, &context_packet_len);
+                encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0);
                 sendto(data_sock, context_buf, context_packet_len, 0,
                       (struct sockaddr *)&client_addr, sizeof(client_addr));
                 g_stats.contexts_sent++;
@@ -1083,7 +1087,8 @@ static void *network_thread(void *arg) {
                                  iq_buffer.data + (offset * 2),  /* I/Q pairs */
                                  samples_this_packet,
                                  &packet_count,
-                                 iq_buffer.timestamp_us);
+                                 iq_buffer.timestamp_us,
+                                 STREAM_ID_RX0);
                 
                 batch_commit_packet(batch, packet_len);
                 packets_this_buffer++;
@@ -1099,7 +1104,7 @@ static void *network_thread(void *arg) {
                     }
                     
                     /* Send context packet immediately */
-                    encode_context_packet(context_buf, &context_packet_len);
+                    encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0);
                     broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
                     g_stats.contexts_sent++;
                     packets_since_context = 0;
