@@ -104,6 +104,28 @@ static lock_free_ring_buffer_t g_ring_buffer_rx1;
 static atomic_uint g_sequence_counter_rx0 = ATOMIC_VAR_INIT(0);
 static atomic_uint g_sequence_counter_rx1 = ATOMIC_VAR_INIT(0);
 
+/* Burst mode configuration and buffers
+ * - Streaming mode (≤11 MSPS): DMA → Ring Buffer → Network (continuous, low latency)
+ * - Burst mode (>11 MSPS): DMA → Burst Buffer → Network (accumulate then rapid-fire)
+ *
+ * Conservative buffer size: 5M samples = 20 MB per channel (40 MB total for dual)
+ * This fits comfortably in Pluto's memory while providing large contiguous IQ chunks
+ */
+#define BURST_MODE_THRESHOLD_HZ 11000000    /* 11 MSPS threshold */
+#define BURST_BUFFER_SAMPLES    (5 * 1024 * 1024)  /* 5M samples per channel */
+
+typedef struct {
+    int16_t *data;              /* Burst accumulation buffer (I/Q pairs) */
+    atomic_size_t fill_count;   /* Current number of I/Q samples accumulated */
+    atomic_bool ready;          /* Buffer full and ready to transmit */
+    uint64_t start_timestamp_us;/* Timestamp of first sample in burst */
+    uint32_t sequence_base;     /* Sequence number at burst start */
+} burst_buffer_t;
+
+static burst_buffer_t g_burst_rx0 = {0};
+static burst_buffer_t g_burst_rx1 = {0};
+static atomic_bool g_burst_mode_enabled = ATOMIC_VAR_INIT(false);
+
 /* Thread argument structure for network thread (Phase 3) */
 typedef struct {
     struct iio_context *iio_ctx;
@@ -755,6 +777,103 @@ static int parse_context_packet(const uint8_t *buf, size_t len,
     return 0;
 }
 
+/* ============================================================================
+ * Burst Mode Functions
+ * ============================================================================ */
+
+/**
+ * Initialize burst buffer - allocate memory
+ */
+static int burst_buffer_init(burst_buffer_t *burst) {
+    burst->data = calloc(BURST_BUFFER_SAMPLES * 2, sizeof(int16_t));  /* *2 for I/Q pairs */
+    if (!burst->data) {
+        fprintf(stderr, "ERROR: Failed to allocate burst buffer (%zu MB)\n",
+                (BURST_BUFFER_SAMPLES * 2 * sizeof(int16_t)) / (1024 * 1024));
+        return -1;
+    }
+    atomic_store(&burst->fill_count, 0);
+    atomic_store(&burst->ready, false);
+    burst->start_timestamp_us = 0;
+    burst->sequence_base = 0;
+    return 0;
+}
+
+/**
+ * Free burst buffer memory
+ */
+static void burst_buffer_free(burst_buffer_t *burst) {
+    if (burst->data) {
+        free(burst->data);
+        burst->data = NULL;
+    }
+}
+
+/**
+ * Reset burst buffer for next accumulation cycle
+ */
+static void burst_buffer_reset(burst_buffer_t *burst) {
+    atomic_store(&burst->fill_count, 0);
+    atomic_store(&burst->ready, false);
+    burst->start_timestamp_us = 0;
+}
+
+/**
+ * Add samples to burst buffer
+ * Returns true if buffer is now full and ready to transmit
+ */
+static bool burst_buffer_add_samples(burst_buffer_t *burst, const int16_t *samples,
+                                     size_t sample_count, uint64_t timestamp_us,
+                                     uint32_t sequence_num) {
+    size_t current_fill = atomic_load(&burst->fill_count);
+
+    /* Record start timestamp on first samples */
+    if (current_fill == 0) {
+        burst->start_timestamp_us = timestamp_us;
+        burst->sequence_base = sequence_num;
+    }
+
+    /* Calculate how many samples we can add */
+    size_t space_available = BURST_BUFFER_SAMPLES - current_fill;
+    size_t samples_to_add = (sample_count < space_available) ? sample_count : space_available;
+
+    /* Copy I/Q pairs to burst buffer */
+    memcpy(burst->data + (current_fill * 2), samples, samples_to_add * 4);
+
+    /* Update fill count */
+    size_t new_fill = current_fill + samples_to_add;
+    atomic_store(&burst->fill_count, new_fill);
+
+    /* Check if buffer is now full */
+    if (new_fill >= BURST_BUFFER_SAMPLES) {
+        atomic_store(&burst->ready, true);
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Update burst mode enabled/disabled based on sample rate
+ */
+static void update_burst_mode(uint32_t sample_rate_hz) {
+    bool should_enable = (sample_rate_hz > BURST_MODE_THRESHOLD_HZ);
+    bool currently_enabled = atomic_load(&g_burst_mode_enabled);
+
+    if (should_enable != currently_enabled) {
+        atomic_store(&g_burst_mode_enabled, should_enable);
+        printf("[Burst Mode] %s (sample rate: %.1f MSPS, threshold: %.1f MSPS)\n",
+               should_enable ? "ENABLED" : "DISABLED",
+               sample_rate_hz / 1e6,
+               BURST_MODE_THRESHOLD_HZ / 1e6);
+
+        /* Reset burst buffers when mode changes */
+        if (should_enable) {
+            burst_buffer_reset(&g_burst_rx0);
+            burst_buffer_reset(&g_burst_rx1);
+        }
+    }
+}
+
 /**
  * Control thread (Core 1) - Receives configuration packets
  *
@@ -874,7 +993,12 @@ static void *dma_reader_thread(void *arg) {
         /* Read channel mode to determine buffer format */
         pthread_mutex_lock(&g_sdr_config.mutex);
         channel_mode_t mode = g_sdr_config.channel_mode;
+        uint32_t current_rate = g_sdr_config.sample_rate_hz;
         pthread_mutex_unlock(&g_sdr_config.mutex);
+
+        /* Update burst mode based on sample rate */
+        update_burst_mode(current_rate);
+        bool burst_mode = atomic_load(&g_burst_mode_enabled);
 
         uint64_t timestamp_us = get_timestamp_us();
 
@@ -912,14 +1036,23 @@ static void *dma_reader_thread(void *arg) {
                 *dst_rx1++ = *src++;  /* RX1 Q */
             }
 
-            /* Push to both ring buffers */
-            bool rx0_ok = ring_buffer_push(&g_ring_buffer_rx0, &buffer_rx0);
-            bool rx1_ok = ring_buffer_push(&g_ring_buffer_rx1, &buffer_rx1);
-
-            if (!rx0_ok || !rx1_ok) {
-                g_stats.ring_buffer_drops++;
-            } else {
+            if (burst_mode) {
+                /* Burst mode: accumulate samples in burst buffers */
+                burst_buffer_add_samples(&g_burst_rx0, buffer_rx0.data, num_samples,
+                                        timestamp_us, buffer_rx0.sequence_num);
+                burst_buffer_add_samples(&g_burst_rx1, buffer_rx1.data, num_samples,
+                                        timestamp_us, buffer_rx1.sequence_num);
                 g_stats.dma_buffers_processed++;
+            } else {
+                /* Streaming mode: push to ring buffers immediately */
+                bool rx0_ok = ring_buffer_push(&g_ring_buffer_rx0, &buffer_rx0);
+                bool rx1_ok = ring_buffer_push(&g_ring_buffer_rx1, &buffer_rx1);
+
+                if (!rx0_ok || !rx1_ok) {
+                    g_stats.ring_buffer_drops++;
+                } else {
+                    g_stats.dma_buffers_processed++;
+                }
             }
 
         } else {
@@ -944,12 +1077,22 @@ static void *dma_reader_thread(void *arg) {
             /* Fast memcpy - copy entire buffer at once */
             memcpy(buffer_entry.data, samples, num_samples * 4);
 
-            /* Push to ring buffer (non-blocking) */
-            if (!ring_buffer_push(target_buffer, &buffer_entry)) {
-                g_stats.ring_buffer_drops++;
-                /* Ring buffer full - network thread may be overloaded */
-            } else {
+            if (burst_mode) {
+                /* Burst mode: accumulate samples in burst buffer */
+                burst_buffer_t *target_burst =
+                    (mode == CHANNEL_MODE_SINGLE_RX1) ? &g_burst_rx1 : &g_burst_rx0;
+
+                burst_buffer_add_samples(target_burst, buffer_entry.data, num_samples,
+                                        timestamp_us, buffer_entry.sequence_num);
                 g_stats.dma_buffers_processed++;
+            } else {
+                /* Streaming mode: push to ring buffer (non-blocking) */
+                if (!ring_buffer_push(target_buffer, &buffer_entry)) {
+                    g_stats.ring_buffer_drops++;
+                    /* Ring buffer full - network thread may be overloaded */
+                } else {
+                    g_stats.dma_buffers_processed++;
+                }
             }
         }
 
@@ -962,17 +1105,84 @@ static void *dma_reader_thread(void *arg) {
     return NULL;
 }
 
+/**
+ * Helper: Transmit IQ buffer as VITA49 packets
+ * Used by both streaming mode (ring buffer) and burst mode
+ */
+static void transmit_iq_buffer(iq_buffer_entry_t *iq_buffer, uint32_t stream_id,
+                               uint8_t *packet_counter, int *context_counter,
+                               bool *sample_loss_flag, int data_sock,
+                               packet_batch_t *batch, uint8_t *context_buf,
+                               size_t *context_packet_len) {
+    size_t offset = 0;
+    size_t packets_this_buffer = 0;
+    size_t bytes_this_buffer = 0;
+
+    /* Encode and batch all packets from this buffer */
+    while (offset < iq_buffer->sample_count) {
+        size_t samples_this_packet = MIN(g_samples_per_packet,
+                                         iq_buffer->sample_count - offset);
+
+        uint8_t *packet_buf = batch_get_buffer(batch);
+        size_t packet_len;
+
+        encode_data_packet(packet_buf, &packet_len,
+                         iq_buffer->data + (offset * 2),
+                         samples_this_packet,
+                         packet_counter,
+                         iq_buffer->timestamp_us,
+                         stream_id,
+                         *sample_loss_flag);
+
+        batch_commit_packet(batch, packet_len);
+        packets_this_buffer++;
+        bytes_this_buffer += packet_len;
+        offset += samples_this_packet;
+
+        /* Send context packet periodically */
+        (*context_counter)++;
+        if (*context_counter >= CONTEXT_INTERVAL) {
+            if (batch->count > 0) {
+                batch_flush_to_all_subscribers(data_sock, batch);
+                batch_init(batch);
+            }
+
+            encode_context_packet(context_buf, context_packet_len, stream_id, *sample_loss_flag);
+            broadcast_to_subscribers(data_sock, context_buf, *context_packet_len);
+            g_stats.contexts_sent++;
+            *context_counter = 0;
+            *sample_loss_flag = false;  /* Reset after reporting */
+        }
+
+        if (batch->count >= SEND_BATCH_SIZE) {
+            batch_flush_to_all_subscribers(data_sock, batch);
+            batch_init(batch);
+        }
+    }
+
+    /* Flush any remaining packets */
+    if (batch->count > 0) {
+        batch_flush_to_all_subscribers(data_sock, batch);
+        batch_init(batch);
+    }
+
+    /* Update statistics */
+    g_stats.network_thread_processed++;
+    g_stats.packets_sent += packets_this_buffer;
+    g_stats.bytes_sent += bytes_this_buffer;
+}
+
 /*
  * Network Thread (Core 1) - Multicore Optimization Consumer
- * 
+ *
  * Phase 3: Combined network transmission and configuration handling
  * Consumes from ring buffer and handles:
  * - VITA49 packet encoding from ring buffer IQ data
- * - sendmmsg() batch transmission  
+ * - sendmmsg() batch transmission
  * - Configuration packet reception (merged from control_thread)
  * - Subscriber management
  * - Context packet transmission
- * 
+ *
  * This achieves 95% Core 1 utilization vs 10% in Phase 2.
  */
 static void *network_thread(void *arg) {
@@ -1102,13 +1312,79 @@ static void *network_thread(void *arg) {
                 work_done = true;
             }
         }
-        
-        /* 2. Consume IQ data from ring buffer(s) and transmit */
+
+        /* 2. Consume IQ data from burst buffer(s) or ring buffer(s) and transmit */
+
+        /* Check if in burst mode */
+        bool burst_mode = atomic_load(&g_burst_mode_enabled);
 
         /* Read channel mode to determine single vs dual-channel */
         pthread_mutex_lock(&g_sdr_config.mutex);
         channel_mode_t mode = g_sdr_config.channel_mode;
         pthread_mutex_unlock(&g_sdr_config.mutex);
+
+        /* BURST MODE: Transmit accumulated samples when buffer is full */
+        if (burst_mode) {
+            bool transmitted_rx0 = false;
+            bool transmitted_rx1 = false;
+
+            /* Check RX0 burst buffer */
+            if (atomic_load(&g_burst_rx0.ready) &&
+                (mode == CHANNEL_MODE_SINGLE_RX0 || mode == CHANNEL_MODE_DUAL)) {
+
+                size_t sample_count = atomic_load(&g_burst_rx0.fill_count);
+                printf("[Network Thread] Transmitting RX0 burst: %zu samples (%.1f MB)\n",
+                       sample_count, (sample_count * 4.0) / (1024 * 1024));
+
+                /* Create temporary buffer entry for burst transmission */
+                iq_buffer_entry_t burst_entry = {
+                    .data = g_burst_rx0.data,
+                    .sample_count = sample_count,
+                    .timestamp_us = g_burst_rx0.start_timestamp_us,
+                    .sequence_num = g_burst_rx0.sequence_base,
+                    .buffer_id = 0
+                };
+
+                /* Transmit using existing packet encoding (stream ID RX0) */
+                transmit_iq_buffer(&burst_entry, STREAM_ID_RX0, &packet_count_rx0,
+                                  &packets_since_context_rx0, &sample_loss_rx0,
+                                  data_sock, batch, context_buf, &context_packet_len);
+
+                /* Reset for next burst */
+                burst_buffer_reset(&g_burst_rx0);
+                transmitted_rx0 = true;
+            }
+
+            /* Check RX1 burst buffer */
+            if (atomic_load(&g_burst_rx1.ready) &&
+                (mode == CHANNEL_MODE_SINGLE_RX1 || mode == CHANNEL_MODE_DUAL)) {
+
+                size_t sample_count = atomic_load(&g_burst_rx1.fill_count);
+                printf("[Network Thread] Transmitting RX1 burst: %zu samples (%.1f MB)\n",
+                       sample_count, (sample_count * 4.0) / (1024 * 1024));
+
+                iq_buffer_entry_t burst_entry = {
+                    .data = g_burst_rx1.data,
+                    .sample_count = sample_count,
+                    .timestamp_us = g_burst_rx1.start_timestamp_us,
+                    .sequence_num = g_burst_rx1.sequence_base,
+                    .buffer_id = 0
+                };
+
+                transmit_iq_buffer(&burst_entry, STREAM_ID_RX1, &packet_count_rx1,
+                                  &packets_since_context_rx1, &sample_loss_rx1,
+                                  data_sock, batch, context_buf, &context_packet_len);
+
+                burst_buffer_reset(&g_burst_rx1);
+                transmitted_rx1 = true;
+            }
+
+            if (transmitted_rx0 || transmitted_rx1) {
+                work_done = true;
+            }
+        }
+        /* STREAMING MODE: Continuous transmission from ring buffers */
+        else {
 
         if (mode == CHANNEL_MODE_DUAL) {
             /* Dual-channel mode: Pop from both buffers and alternate packets */
@@ -1354,7 +1630,8 @@ static void *network_thread(void *arg) {
                 work_done = true;
             }
         }
-        
+        }  /* End of streaming mode (ring buffer) processing */
+
         /* 3. Brief sleep only if no work was done */
         if (!work_done) {
             usleep(10);  /* 10 microseconds - very brief */
@@ -1560,11 +1837,25 @@ int main(int argc, char **argv) {
     printf("Control: %d, Data: %d\n\n", CONTROL_PORT, DATA_PORT);
 
     /* Initialize ring buffers for multicore optimization */
-    ring_buffer_init(&g_ring_buffer_rx0_rx0);
-    ring_buffer_init(&g_ring_buffer_rx0_rx1);
+    ring_buffer_init(&g_ring_buffer_rx0);
+    ring_buffer_init(&g_ring_buffer_rx1);
     printf("Ring buffers initialized: RX0=%d entries (%zu MB), RX1=%d entries (%zu MB)\n",
-           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer_rx0_rx0) / (1024*1024),
-           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer_rx0_rx1) / (1024*1024));
+           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer_rx0) / (1024*1024),
+           RING_BUFFER_CAPACITY, sizeof(g_ring_buffer_rx1) / (1024*1024));
+
+    /* Initialize burst mode buffers */
+    if (burst_buffer_init(&g_burst_rx0) < 0 || burst_buffer_init(&g_burst_rx1) < 0) {
+        fprintf(stderr, "ERROR: Failed to allocate burst buffers\n");
+        close(control_sock);
+        iio_context_destroy(ctx);
+        return 1;
+    }
+    printf("Burst buffers initialized: %zu samples per channel (%.1f MB each, %.1f MB total)\n",
+           BURST_BUFFER_SAMPLES,
+           (BURST_BUFFER_SAMPLES * 2 * sizeof(int16_t)) / (1024.0 * 1024.0),
+           (BURST_BUFFER_SAMPLES * 2 * sizeof(int16_t) * 2) / (1024.0 * 1024.0));
+    printf("Burst mode: Enabled automatically when sample rate > %.1f MSPS\n\n",
+           BURST_MODE_THRESHOLD_HZ / 1e6);
 
     /* Start multicore optimized threads - Phase 3: Full dual-core utilization */
     pthread_t dma_tid, network_tid;
@@ -1620,6 +1911,10 @@ int main(int argc, char **argv) {
     /* Cleanup */
     pthread_join(dma_tid, NULL);
     pthread_join(network_tid, NULL);
+
+    /* Free burst buffers */
+    burst_buffer_free(&g_burst_rx0);
+    burst_buffer_free(&g_burst_rx1);
 
     close(control_sock);
     iio_context_destroy(ctx);
