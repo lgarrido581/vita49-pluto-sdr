@@ -117,7 +117,7 @@ class ConnectionManager:
 # =============================================================================
 
 class VITA49WebHandler:
-    """Handles VITA49 stream reception and processing for web clients"""
+    """Handles VITA49 stream reception and processing for web clients (Multi-Stream)"""
 
     def __init__(self, connection_manager: ConnectionManager):
         self.manager = connection_manager
@@ -131,12 +131,17 @@ class VITA49WebHandler:
         self.update_rate_hz = 20.0
         self.averaging = 4
 
-        # Buffers
+        # Multi-stream buffers: stream_id -> buffers
+        self.stream_buffers: Dict[int, deque] = {}  # stream_id -> sample buffer
+        self.stream_metadata: Dict[int, dict] = {}  # stream_id -> metadata dict
+        self.stream_stats: Dict[int, dict] = {}     # stream_id -> statistics dict
+
+        # Legacy single-stream buffers (for backward compatibility)
         self.sample_buffer = deque(maxlen=self.fft_size * 4)
         self.waterfall_buffer = deque(maxlen=100)
         self.packet_history = deque(maxlen=100)
 
-        # Stream metadata from context packets
+        # Legacy metadata (backward compatibility)
         self.metadata = {
             'sample_rate_hz': 30e6,
             'center_freq_hz': 2.4e9,
@@ -145,7 +150,7 @@ class VITA49WebHandler:
             'context_received': False
         }
 
-        # Statistics
+        # Global statistics (backward compatibility)
         self.stats = {
             'packets_received': 0,
             'samples_received': 0,
@@ -203,47 +208,93 @@ class VITA49WebHandler:
 
         logger.info("VITA49 web handler stopped")
 
-    def _on_context_received(self, context_data: bytes):
-        """Handle received context packets"""
+    def _on_context_received(self, stream_id: int, context: VRTContextPacket):
+        """Handle received context packets (multi-stream aware)"""
         try:
-            context = VRTContextPacket.decode(context_data)
+            # Initialize stream metadata if first context from this stream
+            if stream_id not in self.stream_metadata:
+                self.stream_metadata[stream_id] = {
+                    'sample_rate_hz': 30e6,
+                    'center_freq_hz': 2.4e9,
+                    'bandwidth_hz': 20e6,
+                    'gain_db': 20.0,
+                    'context_received': False,
+                    'channel_name': f"RX{(stream_id & 0xFF) - 1}" if stream_id & 0xFF else "RX0"
+                }
 
-            # Update metadata
+            metadata = self.stream_metadata[stream_id]
+
+            # Update per-stream metadata
             if context.sample_rate_hz:
-                self.metadata['sample_rate_hz'] = context.sample_rate_hz
+                metadata['sample_rate_hz'] = context.sample_rate_hz
             if context.rf_reference_frequency_hz:
-                self.metadata['center_freq_hz'] = context.rf_reference_frequency_hz
+                metadata['center_freq_hz'] = context.rf_reference_frequency_hz
             if context.bandwidth_hz:
-                self.metadata['bandwidth_hz'] = context.bandwidth_hz
+                metadata['bandwidth_hz'] = context.bandwidth_hz
             if context.gain_db is not None:
-                self.metadata['gain_db'] = context.gain_db
+                metadata['gain_db'] = context.gain_db
 
-            self.metadata['context_received'] = True
+            metadata['context_received'] = True
+
+            # Update legacy global metadata (backward compatibility - use first stream or RX0)
+            if not self.metadata['context_received'] or stream_id == 0x01000001:
+                self.metadata.update(metadata)
+
             self.stats['context_packets_received'] += 1
 
-            # Broadcast metadata update (thread-safe)
+            # Broadcast multi-stream metadata update (thread-safe)
             if self._event_loop:
                 asyncio.run_coroutine_threadsafe(
                     self.manager.broadcast({
-                        'type': 'metadata',
-                        'data': self.metadata
+                        'type': 'metadata_multistream',
+                        'streams': {f"0x{sid:08X}": meta for sid, meta in self.stream_metadata.items()},
+                        'timestamp': time.time()
                     }),
                     self._event_loop
                 )
 
-            logger.info(f"Context packet received: {self.metadata['center_freq_hz']/1e9:.3f} GHz, "
-                       f"{self.metadata['sample_rate_hz']/1e6:.1f} MSPS")
+            logger.info(f"Stream 0x{stream_id:08X}: Context packet received - "
+                       f"{metadata['center_freq_hz']/1e9:.3f} GHz, "
+                       f"{metadata['sample_rate_hz']/1e6:.1f} MSPS")
 
         except Exception as e:
-            logger.error(f"Error parsing context packet: {e}")
+            logger.error(f"Error processing context packet for stream 0x{stream_id:08X}: {e}")
 
-    def _on_samples_received(self, packet: VRTSignalDataPacket, samples: np.ndarray):
-        """Handle received IQ samples"""
-        # Update buffers
+    def _on_samples_received(self, stream_id: int, packet: VRTSignalDataPacket, samples: np.ndarray):
+        """Handle received IQ samples (multi-stream aware)"""
+        # Initialize stream buffers if first packet from this stream
+        if stream_id not in self.stream_buffers:
+            self.stream_buffers[stream_id] = deque(maxlen=self.fft_size * 4)
+            self.stream_stats[stream_id] = {
+                'packets_received': 0,
+                'samples_received': 0,
+                'gaps_detected': 0,
+                'sample_loss_count': 0,
+                'last_packet_time': None
+            }
+            logger.info(f"Stream 0x{stream_id:08X}: New stream initialized")
+
+        # Update per-stream buffers
+        buffer = self.stream_buffers[stream_id]
         for s in samples:
-            self.sample_buffer.append(s)
+            buffer.append(s)
 
-        # Update statistics
+        # Also update legacy global buffer (backward compatibility - use first stream)
+        if not self.sample_buffer or stream_id == 0x01000001:
+            for s in samples:
+                self.sample_buffer.append(s)
+
+        # Update per-stream statistics
+        stream_stats = self.stream_stats[stream_id]
+        stream_stats['packets_received'] += 1
+        stream_stats['samples_received'] += len(samples)
+        stream_stats['last_packet_time'] = time.time()
+
+        # Check for sample loss from trailer
+        if packet.trailer and packet.trailer.sample_loss:
+            stream_stats['sample_loss_count'] += 1
+
+        # Update global statistics (backward compatibility)
         self.stats['packets_received'] += 1
         self.stats['samples_received'] += len(samples)
         self.stats['last_packet_time'] = time.time()
@@ -291,13 +342,73 @@ class VITA49WebHandler:
         if current_time - self._last_broadcast_time >= self._broadcast_interval:
             if self._event_loop:
                 asyncio.run_coroutine_threadsafe(
-                    self._process_and_broadcast(),
+                    self._process_and_broadcast_multistream(),
                     self._event_loop
                 )
             self._last_broadcast_time = current_time
 
+    async def _process_and_broadcast_multistream(self):
+        """Process samples from all streams and broadcast to clients"""
+        # Process each active stream
+        spectrum_data = {}
+
+        for stream_id, buffer in self.stream_buffers.items():
+            if len(buffer) < self.fft_size:
+                continue
+
+            try:
+                # Get samples for FFT
+                samples = np.array(buffer)[-self.fft_size:]
+
+                # Compute FFT
+                window = np.hanning(len(samples))
+                spectrum = np.fft.fftshift(np.fft.fft(samples * window))
+                spectrum_mag = np.abs(spectrum)
+                spectrum_db = 20 * np.log10(spectrum_mag + 1e-10)
+
+                # Get frequency bins
+                metadata = self.stream_metadata.get(stream_id, self.metadata)
+                sample_rate = metadata.get('sample_rate_hz', 30e6)
+                center_freq = metadata.get('center_freq_hz', 2.4e9)
+                freq_bins = np.fft.fftshift(np.fft.fftfreq(self.fft_size, 1/sample_rate)) + center_freq
+
+                # Get stream stats
+                stats = self.stream_stats.get(stream_id, {})
+                channel_name = metadata.get('channel_name', f"Stream_{stream_id:08X}")
+
+                # Add to spectrum data
+                spectrum_data[f"0x{stream_id:08X}"] = {
+                    'frequencies': freq_bins.tolist(),
+                    'spectrum': spectrum_db.tolist(),
+                    'channel': channel_name,
+                    'center_freq_hz': center_freq,
+                    'sample_rate_hz': sample_rate,
+                    'stats': {
+                        'packets': stats.get('packets_received', 0),
+                        'samples': stats.get('samples_received', 0),
+                        'gaps': stats.get('gaps_detected', 0),
+                        'sample_loss': stats.get('sample_loss_count', 0)
+                    }
+                }
+
+            except Exception as e:
+                logger.error(f"Error processing spectrum for stream 0x{stream_id:08X}: {e}")
+
+        # Broadcast multi-stream data if any streams were processed
+        if spectrum_data:
+            await self.manager.broadcast({
+                'type': 'spectrum_multistream',
+                'streams': spectrum_data,
+                'timestamp': time.time(),
+                'sequence': self._spectrum_sequence
+            })
+            self._spectrum_sequence += 1
+
+        # Also broadcast legacy single-stream data for backward compatibility
+        await self._process_and_broadcast()
+
     async def _process_and_broadcast(self):
-        """Process samples and broadcast to clients"""
+        """Process samples and broadcast to clients (legacy single-stream)"""
         if len(self.sample_buffer) < self.fft_size:
             return
 
