@@ -82,10 +82,24 @@
 #define TX0_STREAM_ID           0x02000000
 #define TX1_STREAM_ID           0x02000001
 
+/* config_epoch carried via VRT Class ID. Matches the Python helper
+ * make_epoch_class_id() in src/vita49/packets.py: when a packet is
+ * tagged, its Class ID has OUI=EPOCH_CLASS_OUI, packet_class_code=
+ * EPOCH_PACKET_CLASS_CODE, and information_class_code=epoch.
+ * Epoch 0 = "untagged" -> no Class ID emitted -> wire format unchanged. */
+#define EPOCH_CLASS_OUI         0x00005A
+#define EPOCH_PACKET_CLASS_CODE 0xE000
+
 /* Global state */
 static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime based on MTU */
+
+/* Monotonic config generation. Bumped by the control thread when a
+ * reconfig context arrives with a new epoch (or when the local config
+ * changes in a way that should invalidate in-flight samples). Streaming
+ * threads read this and stamp it on every outbound packet via Class ID. */
+static volatile uint16_t g_current_epoch = 0;
 
 /* Subscriber list */
 typedef struct {
@@ -427,11 +441,12 @@ static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len) {
     pthread_mutex_unlock(&g_subscribers_mutex);
 }
 
-/* Encode VITA49 Context packet for the given stream_id (channel). */
+/* Encode VITA49 Context packet for the given stream_id (channel).
+ * If g_current_epoch != 0, inserts a Class ID between stream_id and
+ * timestamps to tag this context with the current epoch. */
 static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id) {
-    vrt_context_header_t *hdr = (vrt_context_header_t *)buf;
-    uint8_t *payload = buf + sizeof(vrt_context_header_t);
-    size_t payload_len = 0;
+    uint16_t epoch = g_current_epoch;
+    bool emit_class_id = (epoch != 0);
 
     pthread_mutex_lock(&g_sdr_config.mutex);
     uint64_t freq = g_sdr_config.center_freq_hz;
@@ -440,115 +455,116 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id)
     double gain = g_sdr_config.gain_db;
     pthread_mutex_unlock(&g_sdr_config.mutex);
 
-    /* Timestamp */
-    uint64_t ts_us = get_timestamp_us();
-    uint32_t ts_int = ts_us / 1000000;
-    uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;  /* Convert to picoseconds */
-
-    /* Get current health status */
     pthread_mutex_lock(&g_stats.mutex);
     uint64_t underflows = g_stats.underflows;
     uint64_t overflows = g_stats.overflows;
     pthread_mutex_unlock(&g_stats.mutex);
 
-    /* Context Indicator Field (CIF) */
-    uint32_t cif = 0;
-    cif |= (1 << 29);  /* bandwidth */
-    cif |= (1 << 27);  /* rf_reference_frequency */
-    cif |= (1 << 23);  /* gain */
-    cif |= (1 << 21);  /* sample_rate */
-    cif |= (1 << 19);  /* state_event_indicators */
+    /* CIF: bandwidth, freq, gain, sample_rate, state_event */
+    uint32_t cif = (1 << 29) | (1 << 27) | (1 << 23) | (1 << 21) | (1 << 19);
 
-    /* Encode context fields in DESCENDING CIF bit order (VITA49 requirement)
-     * Bit 29: Bandwidth
-     * Bit 27: RF Reference Frequency
-     * Bit 23: Gain (comes BEFORE bit 21!)
-     * Bit 21: Sample Rate
-     * Bit 19: State/Event Indicators
-     *
-     * NOTE: Use memcpy to avoid alignment issues with uint64_t at non-8-byte offsets
-     */
-    int64_t bw_fixed = ((int64_t)bw * (1 << 20));
+    /* Pre-encode the fixed-point context fields (descending CIF bit order:
+     * bandwidth, freq, gain, sample_rate, state_event). */
+    int64_t bw_fixed   = ((int64_t)bw   * (1 << 20));
     int64_t freq_fixed = ((int64_t)freq * (1 << 20));
     int64_t rate_fixed = ((int64_t)rate * (1 << 20));
     int16_t gain_fixed = (int16_t)(gain * 128);
 
-    /* Bit 29: Bandwidth (64-bit, 20-bit radix) */
+    /* Write fields sequentially. VITA-49 field order:
+     *   header, stream_id, [class_id], ts_int, ts_frac, cif, payload */
+    size_t off = 0;
+    off += 4;  /* header slot, written last */
+
+    uint32_t sid_be = htonl_custom(stream_id);
+    memcpy(buf + off, &sid_be, 4);
+    off += 4;
+
+    if (emit_class_id) {
+        uint32_t w1 = (EPOCH_CLASS_OUI & 0xFFFFFF) << 8;
+        uint32_t w2 = ((uint32_t)epoch << 16) | (EPOCH_PACKET_CLASS_CODE & 0xFFFF);
+        uint32_t w1_be = htonl_custom(w1);
+        uint32_t w2_be = htonl_custom(w2);
+        memcpy(buf + off,     &w1_be, 4);
+        memcpy(buf + off + 4, &w2_be, 4);
+        off += 8;
+    }
+
+    uint64_t ts_us = get_timestamp_us();
+    uint32_t ts_int = (uint32_t)(ts_us / 1000000);
+    uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;
+    uint32_t ts_int_be = htonl_custom(ts_int);
+    uint64_t ts_frac_be = htonll(ts_frac);
+    memcpy(buf + off, &ts_int_be, 4);  off += 4;
+    memcpy(buf + off, &ts_frac_be, 8); off += 8;
+
+    uint32_t cif_be = htonl_custom(cif);
+    memcpy(buf + off, &cif_be, 4);
+    off += 4;
+
+    /* CIF-ordered payload */
     uint64_t bw_be = htonll(bw_fixed);
-    memcpy(payload + payload_len, &bw_be, 8);
-    payload_len += 8;
+    memcpy(buf + off, &bw_be, 8);
+    off += 8;
 
-    /* Bit 27: RF Reference Frequency (64-bit, 20-bit radix) */
     uint64_t freq_be = htonll(freq_fixed);
-    memcpy(payload + payload_len, &freq_be, 8);
-    payload_len += 8;
+    memcpy(buf + off, &freq_be, 8);
+    off += 8;
 
-    /* Bit 23: Gain - Stage 1 and Stage 2 (two 16-bit values, 7-bit radix) */
     uint16_t gain_be = htons(gain_fixed);
-    memcpy(payload + payload_len, &gain_be, 2);
-    payload_len += 2;
+    memcpy(buf + off, &gain_be, 2);
+    off += 2;
     uint16_t zero = 0;
-    memcpy(payload + payload_len, &zero, 2);  /* Stage 2 (unused) */
-    payload_len += 2;
+    memcpy(buf + off, &zero, 2);  /* Stage 2 (unused) */
+    off += 2;
 
-    /* Bit 21: Sample Rate (64-bit, 20-bit radix) */
     uint64_t rate_be = htonll(rate_fixed);
-    memcpy(payload + payload_len, &rate_be, 8);
-    payload_len += 8;
+    memcpy(buf + off, &rate_be, 8);
+    off += 8;
 
-    /* Bit 19: State/Event Indicators (32-bit field)
-     * Bit 31: Calibrated Time (1 = time is calibrated)
-     * Bit 19: Overrange (1 = overflow detected)
-     * Bit 18: Sample Loss (1 = underflow/sample loss detected)
-     */
-    uint32_t state_event = 0;
-    state_event |= (1U << 31);  /* Calibrated Time */
-    if (overflows > 0) {
-        state_event |= (1 << 19);  /* Overrange indicator */
-    }
-    if (underflows > 0) {
-        state_event |= (1 << 18);  /* Sample Loss indicator */
-    }
+    uint32_t state_event = (1U << 31);  /* Calibrated Time */
+    if (overflows > 0)  state_event |= (1 << 19);
+    if (underflows > 0) state_event |= (1 << 18);
     uint32_t state_event_be = htonl_custom(state_event);
-    memcpy(payload + payload_len, &state_event_be, 4);
-    payload_len += 4;
+    memcpy(buf + off, &state_event_be, 4);
+    off += 4;
 
-    /* DEBUG: Log what we're encoding */
+    /* DEBUG: only log first 5 packets to avoid spam */
     static int debug_count = 0;
-    if (debug_count++ < 5) {  /* Only log first 5 packets */
-        printf("[DEBUG] Encoding context: freq=%.1f MHz, rate=%.1f MSPS, gain=%.1f dB\n",
-               freq / 1e6, rate / 1e6, gain);
-        printf("[DEBUG] Fixed-point: freq=%lld, rate=%lld, gain=%d\n",
-               (long long)freq_fixed, (long long)rate_fixed, gain_fixed);
-        printf("[DEBUG] Payload length: %zu bytes\n", payload_len);
+    if (debug_count++ < 5) {
+        printf("[DEBUG] Encoding context: freq=%.1f MHz, rate=%.1f MSPS, gain=%.1f dB, epoch=%u\n",
+               freq / 1e6, rate / 1e6, gain, (unsigned)epoch);
     }
 
-    /* Calculate packet size in 32-bit words */
-    size_t total_words = 1 + 1 + 1 + 2 + 1 + (payload_len / 4);
+    size_t total_words = off / 4;
 
-    /* Build header */
     uint32_t header = 0;
     header |= (VRT_PKT_TYPE_CONTEXT & 0xF) << 28;
+    if (emit_class_id) header |= (1 << 27);
     header |= (VRT_TSI_UTC & 0x3) << 22;
     header |= (VRT_TSF_PICOSECONDS & 0x3) << 20;
     header |= (total_words & 0xFFFF);
+    uint32_t header_be = htonl_custom(header);
+    memcpy(buf, &header_be, 4);
 
-    hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(stream_id);
-    hdr->timestamp_int = htonl_custom(ts_int);
-    hdr->timestamp_frac = htonll(ts_frac);
-    hdr->cif = htonl_custom(cif);
-
-    *len = sizeof(vrt_context_header_t) + payload_len;
+    *len = off;
 }
 
-/* Encode VITA49 Data packet for the given stream_id (channel). */
+/* Encode VITA49 Data packet for the given stream_id (channel). If
+ * g_current_epoch != 0, inserts a Class ID (8 bytes) BETWEEN stream_id
+ * and timestamps (per VITA-49 spec ordering) to tag this packet with
+ * the config epoch. */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count, uint32_t stream_id) {
+    uint16_t epoch = g_current_epoch;
+    bool emit_class_id = (epoch != 0);
+    size_t class_id_bytes = emit_class_id ? 8 : 0;
+    size_t fixed_prefix_bytes = 4 /*header*/ + 4 /*stream_id*/ + class_id_bytes
+                              + 4 /*ts_int*/ + 8 /*ts_frac*/;
+
     /* Validate buffer won't overflow */
-    size_t required_size = sizeof(vrt_data_header_t) +
-                          (num_samples * 2 * sizeof(int16_t)) +
-                          sizeof(uint32_t);  /* trailer */
+    size_t required_size = fixed_prefix_bytes
+                         + (num_samples * 2 * sizeof(int16_t))
+                         + sizeof(uint32_t);  /* trailer */
 
     if (required_size > MAX_PACKET_BUFFER) {
         fprintf(stderr, "ERROR: Packet would exceed buffer size (%zu > %d)\n",
@@ -557,66 +573,115 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
         return;
     }
 
-    vrt_data_header_t *hdr = (vrt_data_header_t *)buf;
-    int16_t *payload = (int16_t *)(buf + sizeof(vrt_data_header_t));
+    /* Write fields sequentially; we can't use a struct cast because the
+     * optional Class ID changes offsets. VITA-49 field order:
+     *   header, stream_id, [class_id], ts_int, ts_frac, payload, trailer */
+    size_t off = 0;
 
-    /* Copy and convert to big-endian */
+    /* Reserve header slot — written last once we know total_words */
+    off += 4;
+
+    /* stream_id */
+    uint32_t sid_be = htonl_custom(stream_id);
+    memcpy(buf + off, &sid_be, 4);
+    off += 4;
+
+    /* Optional Class ID (VRT layout: word1 = OUI << 8, word2 =
+     * info_class_code << 16 | packet_class_code) */
+    if (emit_class_id) {
+        uint32_t w1 = (EPOCH_CLASS_OUI & 0xFFFFFF) << 8;
+        uint32_t w2 = ((uint32_t)epoch << 16) | (EPOCH_PACKET_CLASS_CODE & 0xFFFF);
+        uint32_t w1_be = htonl_custom(w1);
+        uint32_t w2_be = htonl_custom(w2);
+        memcpy(buf + off,     &w1_be, 4);
+        memcpy(buf + off + 4, &w2_be, 4);
+        off += 8;
+    }
+
+    /* Timestamps */
+    uint64_t ts_us = get_timestamp_us();
+    uint32_t ts_int = (uint32_t)(ts_us / 1000000);
+    uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;
+    uint32_t ts_int_be = htonl_custom(ts_int);
+    uint64_t ts_frac_be = htonll(ts_frac);
+    memcpy(buf + off, &ts_int_be, 4);  off += 4;
+    memcpy(buf + off, &ts_frac_be, 8); off += 8;
+
+    /* Payload (interleaved I,Q big-endian int16) */
+    int16_t *payload = (int16_t *)(buf + off);
     for (size_t i = 0; i < num_samples * 2; i++) {
         payload[i] = htons(iq_data[i]);
     }
-
     size_t payload_bytes = num_samples * 2 * sizeof(int16_t);
 
-    /* Pad to 32-bit boundary */
+    /* Pad payload to 32-bit boundary */
     size_t padding = (4 - (payload_bytes % 4)) % 4;
     if (padding) {
         memset((uint8_t *)payload + payload_bytes, 0, padding);
         payload_bytes += padding;
     }
+    off += payload_bytes;
 
     /* Trailer */
-    uint32_t *trailer = (uint32_t *)(buf + sizeof(vrt_data_header_t) + payload_bytes);
-    *trailer = htonl_custom(0x40000000);  /* valid_data = 1 */
+    uint32_t trailer_be = htonl_custom(0x40000000);  /* valid_data = 1 */
+    memcpy(buf + off, &trailer_be, 4);
+    off += 4;
 
-    /* Calculate packet size */
-    size_t total_words = 1 + 1 + 1 + 2 + (payload_bytes / 4) + 1;
+    /* Total size in 32-bit words */
+    size_t total_words = off / 4;
 
-    /* Timestamp */
-    uint64_t ts_us = get_timestamp_us();
-    uint32_t ts_int = ts_us / 1000000;
-    uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;
-
-    /* Build header */
+    /* Build and write the header word last */
     uint32_t header = 0;
     header |= (VRT_PKT_TYPE_DATA & 0xF) << 28;
-    header |= (1 << 26);  /* Trailer present */
+    if (emit_class_id) header |= (1 << 27);  /* class_id_present */
+    header |= (1 << 26);  /* trailer_present */
     header |= (VRT_TSI_UTC & 0x3) << 22;
     header |= (VRT_TSF_PICOSECONDS & 0x3) << 20;
     header |= ((*packet_count) & 0xF) << 16;
     header |= (total_words & 0xFFFF);
+    uint32_t header_be = htonl_custom(header);
+    memcpy(buf, &header_be, 4);
 
-    hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(stream_id);
-    hdr->timestamp_int = htonl_custom(ts_int);
-    hdr->timestamp_frac = htonll(ts_frac);
-
-    *len = sizeof(vrt_data_header_t) + payload_bytes + sizeof(uint32_t);
+    *len = off;
     *packet_count = (*packet_count + 1) & 0xF;
 }
 
-/* Parse VITA49 Context packet and extract configuration */
+/* Parse VITA49 Context packet and extract configuration.
+ * Also extracts the config_epoch from the Class ID if present
+ * (Class ID with packet_class_code == EPOCH_PACKET_CLASS_CODE).
+ * If no epoch is carried, *epoch_out is left untouched. */
 static int parse_context_packet(const uint8_t *buf, size_t len,
-                                uint64_t *freq_hz, uint32_t *rate_hz, double *gain_db) {
+                                uint64_t *freq_hz, uint32_t *rate_hz, double *gain_db,
+                                uint16_t *epoch_out) {
     if (len < 28) return -1;  /* Minimum context packet size */
 
-    /* Skip VRT header (4 bytes) and stream ID (4 bytes) */
-    const uint8_t *p = buf + 8;
+    /* Read header to learn about optional fields */
+    uint32_t hdr_word = ntohl(*(const uint32_t *)buf);
+    bool class_id_present = (hdr_word >> 27) & 0x1;
+    const uint8_t *p = buf + 4;
+
+    /* stream_id */
+    p += 4;
+
+    /* Optional Class ID */
+    if (class_id_present) {
+        if ((size_t)(p - buf) + 8 > len) return -1;
+        uint32_t w2 = ntohl(*(const uint32_t *)(p + 4));
+        uint16_t info_class = (uint16_t)((w2 >> 16) & 0xFFFF);
+        uint16_t pkt_class  = (uint16_t)(w2 & 0xFFFF);
+        if (pkt_class == EPOCH_PACKET_CLASS_CODE && epoch_out != NULL) {
+            *epoch_out = info_class;
+        }
+        p += 8;
+    }
 
     /* Skip timestamps (12 bytes) */
+    if ((size_t)(p - buf) + 12 > len) return -1;
     p += 12;
 
     /* Read Context Indicator Field (CIF) */
-    uint32_t cif = ntohl(*(uint32_t *)p);
+    if ((size_t)(p - buf) + 4 > len) return -1;
+    uint32_t cif = ntohl(*(const uint32_t *)p);
     p += 4;
 
     /* Parse context fields in descending CIF bit order (VITA49 spec) */
@@ -691,8 +756,9 @@ static void *control_thread(void *arg) {
         uint64_t new_freq = g_sdr_config.center_freq_hz;
         uint32_t new_rate = g_sdr_config.sample_rate_hz;
         double new_gain = g_sdr_config.gain_db;
+        uint16_t client_epoch = 0;  /* 0 == client didn't tag this context */
 
-        if (parse_context_packet(buf, recv_len, &new_freq, &new_rate, &new_gain) == 0) {
+        if (parse_context_packet(buf, recv_len, &new_freq, &new_rate, &new_gain, &client_epoch) == 0) {
             bool changed = false;
 
             /* Check what changed and update */
@@ -718,6 +784,23 @@ static void *control_thread(void *arg) {
                        g_sdr_config.gain_db, new_gain);
                 g_sdr_config.gain_db = new_gain;
                 changed = true;
+            }
+
+            /* Epoch handling: a client-provided epoch becomes the new
+             * g_current_epoch. If no epoch was tagged but something
+             * changed, auto-bump so consumers can still distinguish
+             * pre- and post-reconfig samples. */
+            if (client_epoch != 0 && client_epoch != g_current_epoch) {
+                printf("[Control] Epoch: %u -> %u (client-tagged)\n",
+                       (unsigned)g_current_epoch, (unsigned)client_epoch);
+                g_current_epoch = client_epoch;
+                changed = true;  /* force flush even if no other field changed */
+            } else if (changed && client_epoch == 0) {
+                uint16_t bumped = g_current_epoch + 1;
+                if (bumped == 0) bumped = 1;  /* skip 0 = "untagged" sentinel */
+                printf("[Control] Epoch: %u -> %u (auto-bumped on reconfig)\n",
+                       (unsigned)g_current_epoch, (unsigned)bumped);
+                g_current_epoch = bumped;
             }
 
             /* Set flag to notify streaming thread to apply changes */
