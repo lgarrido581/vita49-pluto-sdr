@@ -32,15 +32,20 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <iio.h>
 
 /* Configuration */
 #define DEFAULT_FREQ_HZ         2400000000ULL   /* 2.4 GHz */
 #define DEFAULT_RATE_HZ         30000000        /* 30 MSPS */
 #define DEFAULT_GAIN_DB         20.0
-#define DEFAULT_BUFFER_SIZE     16384           /* Samples per buffer */
+#define DEFAULT_TX_GAIN_DB      -10.0           /* AD9361 TX is attenuation: -89.75..0 dB */
+#define DEFAULT_BUFFER_SIZE     16384           /* Samples per RX buffer */
+#define DEFAULT_TX_BUFFER_SIZE  4096            /* Samples per TX push (per channel) */
 #define CONTROL_PORT            4990            /* Config reception port */
-#define DATA_PORT               4991            /* Data streaming port */
+#define DATA_PORT               4991            /* RX data streaming port */
+#define TX_DATA_PORT            4992            /* TX data reception port (inbound IF Data) */
 #define CONTEXT_INTERVAL        100             /* Send context every N packets */
 #define MAX_SUBSCRIBERS         16              /* Max simultaneous receivers */
 
@@ -67,11 +72,15 @@
 #define VRT_TSI_UTC             0x1             /* UTC timestamp */
 #define VRT_TSF_PICOSECONDS     0x2             /* Picosecond fractional time */
 
-/* Stream IDs. High byte 0x01 = RX, low byte = channel index.
- * (TX will use 0x02xx in Phase 5.) Preserves backward-compat with
- * existing consumers that filter on RX0_STREAM_ID. */
+/* Stream IDs. High byte 0x01 = RX, 0x02 = TX. Low byte = channel index.
+ * Preserves backward-compat with existing consumers that filter on
+ * RX0_STREAM_ID. */
+#define RX_STREAM_ID_HIGH_BYTE  0x01
+#define TX_STREAM_ID_HIGH_BYTE  0x02
 #define RX0_STREAM_ID           0x01000000
 #define RX1_STREAM_ID           0x01000001
+#define TX0_STREAM_ID           0x02000000
+#define TX1_STREAM_ID           0x02000001
 
 /* Global state */
 static volatile bool g_running = true;
@@ -119,6 +128,44 @@ static sdr_config_t g_sdr_config = {
     .config_changed = false,
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
+
+/* TX Configuration. Default mask 0x00 = TX disabled (binary stays
+ * RX-only unless --tx-channels is passed). LO and gain are independent
+ * of RX; sample rate is shared (AD9361 hardware constraint). */
+typedef struct {
+    uint64_t center_freq_hz;
+    double gain_db;
+    uint8_t enabled_tx_mask;  /* bit 0 = TX0, bit 1 = TX1 */
+    pthread_mutex_t mutex;
+} tx_config_t;
+
+static tx_config_t g_tx_config = {
+    .center_freq_hz = DEFAULT_FREQ_HZ,
+    .gain_db = DEFAULT_TX_GAIN_DB,
+    .enabled_tx_mask = 0x00,
+    .mutex = PTHREAD_MUTEX_INITIALIZER
+};
+
+/* TX runtime stats */
+typedef struct {
+    uint64_t packets_received;       /* Inbound IF Data packets on TX_DATA_PORT */
+    uint64_t packets_transmitted;    /* Successfully pushed to iio_buffer */
+    uint64_t packets_dropped_wrong_stream;  /* Stream ID high byte != 0x02 */
+    uint64_t packets_dropped_disabled_ch;   /* Stream ID channel not enabled */
+    uint64_t packets_dropped_decode;        /* Failed packet parse */
+    uint64_t push_failures;          /* iio_buffer_push returned < 0 */
+    uint64_t bytes_pushed;
+    pthread_mutex_t mutex;
+} tx_stats_t;
+
+static tx_stats_t g_tx_stats = {0};
+
+/* TX replay mode: when --tx-replay PATH is set, the TX thread reads IQ
+ * from disk instead of accepting UDP packets. Mutually exclusive with
+ * the UDP TX path. File format: raw interleaved int16_t I,Q in native
+ * (little-endian on ARM) byte order, no header. */
+static const char *g_tx_replay_path = NULL;
+static bool g_tx_replay_loop = false;
 
 /* Statistics */
 typedef struct {
@@ -179,7 +226,10 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id)
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint32_t stream_id);
 static void *control_thread(void *arg);
 static void *streaming_thread(void *arg);
+static void *tx_thread(void *arg);
+static void *tx_replay_thread(void *arg);
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
+static int configure_tx(struct iio_context *ctx, struct iio_device **tx_dev_out);
 
 /* Utility functions */
 static inline uint32_t htonl_custom(uint32_t x) {
@@ -1062,6 +1112,370 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
     return 0;
 }
 
+/* Configure AD9361 TX side. Opens cf-ad9361-dds-core-lpc and writes
+ * TX LO + per-channel gain via ad9361-phy. Sample rate is shared with
+ * RX (one BBPLL feeds both ADC and DAC) and is NOT written here. */
+static int configure_tx(struct iio_context *ctx, struct iio_device **tx_dev_out) {
+    struct iio_device *tx_dev = iio_context_find_device(ctx, "cf-ad9361-dds-core-lpc");
+    if (!tx_dev) {
+        fprintf(stderr, "[TX Config] ERROR: cf-ad9361-dds-core-lpc not found\n");
+        return -1;
+    }
+    struct iio_device *phy = iio_context_find_device(ctx, "ad9361-phy");
+    if (!phy) {
+        fprintf(stderr, "[TX Config] ERROR: ad9361-phy not found\n");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_tx_config.mutex);
+
+    /* TX LO via phy altvoltage1 */
+    struct iio_channel *tx_lo = iio_device_find_channel(phy, "altvoltage1", true);
+    if (tx_lo) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%llu", (unsigned long long)g_tx_config.center_freq_hz);
+        iio_channel_attr_write(tx_lo, "frequency", buf);
+    } else {
+        fprintf(stderr, "[TX Config] WARNING: altvoltage1 (TX LO) not found\n");
+    }
+
+    /* TX0 gain: phy voltage0 with is_output=true.
+     * TX1 gain: phy voltage1 with is_output=true. */
+    if (g_tx_config.enabled_tx_mask & 0x01) {
+        struct iio_channel *tx0_phy = iio_device_find_channel(phy, "voltage0", true);
+        if (tx0_phy) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.2f", g_tx_config.gain_db);
+            iio_channel_attr_write(tx0_phy, "hardwaregain", buf);
+        }
+    }
+    if (g_tx_config.enabled_tx_mask & 0x02) {
+        struct iio_channel *tx1_phy = iio_device_find_channel(phy, "voltage1", true);
+        if (tx1_phy) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.2f", g_tx_config.gain_db);
+            iio_channel_attr_write(tx1_phy, "hardwaregain", buf);
+        }
+    }
+
+    /* Enable DAC channels on the dds-core-lpc device. TX0 = voltage0/voltage1,
+     * TX1 = voltage2/voltage3. All with is_output=true. Disable unused ones. */
+    struct iio_channel *tx0_i = iio_device_find_channel(tx_dev, "voltage0", true);
+    struct iio_channel *tx0_q = iio_device_find_channel(tx_dev, "voltage1", true);
+    struct iio_channel *tx1_i = iio_device_find_channel(tx_dev, "voltage2", true);
+    struct iio_channel *tx1_q = iio_device_find_channel(tx_dev, "voltage3", true);
+
+    if (g_tx_config.enabled_tx_mask & 0x01) {
+        if (tx0_i) iio_channel_enable(tx0_i);
+        if (tx0_q) iio_channel_enable(tx0_q);
+    } else {
+        if (tx0_i) iio_channel_disable(tx0_i);
+        if (tx0_q) iio_channel_disable(tx0_q);
+    }
+    if (g_tx_config.enabled_tx_mask & 0x02) {
+        if (tx1_i) iio_channel_enable(tx1_i);
+        if (tx1_q) iio_channel_enable(tx1_q);
+    } else {
+        if (tx1_i) iio_channel_disable(tx1_i);
+        if (tx1_q) iio_channel_disable(tx1_q);
+    }
+
+    printf("[TX Config] Configured: %.1f MHz, %.2f dB, tx_mask=0x%02X\n",
+           g_tx_config.center_freq_hz / 1e6,
+           g_tx_config.gain_db,
+           g_tx_config.enabled_tx_mask);
+
+    pthread_mutex_unlock(&g_tx_config.mutex);
+
+    *tx_dev_out = tx_dev;
+    return 0;
+}
+
+/* TX thread: listen on UDP TX_DATA_PORT for VITA-49 IF Data packets,
+ * decode, and push to the AD9361 TX DAC via libiio. v1 design: one
+ * inbound UDP packet -> one iio_buffer_push (synchronous, no ring
+ * buffer). Per-packet payload is padded with zeros to TX buffer size,
+ * or truncated if larger. */
+static void *tx_thread(void *arg) {
+    struct iio_context *ctx = (struct iio_context *)arg;
+    struct iio_device *tx_dev = NULL;
+
+    if (configure_tx(ctx, &tx_dev) < 0) {
+        fprintf(stderr, "[TX] Hardware configuration failed; thread exiting\n");
+        return NULL;
+    }
+
+    struct iio_buffer *txbuf = iio_device_create_buffer(tx_dev, DEFAULT_TX_BUFFER_SIZE, false);
+    if (!txbuf) {
+        fprintf(stderr, "[TX] iio_device_create_buffer failed\n");
+        return NULL;
+    }
+
+    int tx_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (tx_sock < 0) {
+        fprintf(stderr, "[TX] Failed to create UDP socket\n");
+        iio_buffer_destroy(txbuf);
+        return NULL;
+    }
+    int rcvbuf = 1024 * 1024;
+    setsockopt(tx_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in tx_addr = {0};
+    tx_addr.sin_family = AF_INET;
+    tx_addr.sin_addr.s_addr = INADDR_ANY;
+    tx_addr.sin_port = htons(TX_DATA_PORT);
+    if (bind(tx_sock, (struct sockaddr *)&tx_addr, sizeof(tx_addr)) < 0) {
+        fprintf(stderr, "[TX] Failed to bind port %d\n", TX_DATA_PORT);
+        close(tx_sock);
+        iio_buffer_destroy(txbuf);
+        return NULL;
+    }
+    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(tx_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    printf("[TX] Listening for IF Data packets on port %d (push %d samples/buffer)\n",
+           TX_DATA_PORT, DEFAULT_TX_BUFFER_SIZE);
+
+    static uint8_t recv_buf[MAX_PACKET_BUFFER];
+
+    while (g_running) {
+        ssize_t recv_len = recvfrom(tx_sock, recv_buf, sizeof(recv_buf), 0, NULL, NULL);
+        if (recv_len < 0) continue;  /* timeout -> re-check g_running */
+        if (recv_len < 20) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_decode++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        pthread_mutex_lock(&g_tx_stats.mutex);
+        g_tx_stats.packets_received++;
+        pthread_mutex_unlock(&g_tx_stats.mutex);
+
+        uint32_t hdr_word = ntohl(*(uint32_t *)recv_buf);
+        uint32_t sid = ntohl(*(uint32_t *)(recv_buf + 4));
+        uint8_t pkt_type = (hdr_word >> 28) & 0xF;
+        bool has_trailer = (hdr_word >> 26) & 0x1;
+        bool class_id_present = (hdr_word >> 27) & 0x1;
+
+        if (pkt_type != VRT_PKT_TYPE_DATA) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_decode++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        uint8_t sid_high = (sid >> 24) & 0xFF;
+        if (sid_high != TX_STREAM_ID_HIGH_BYTE) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_wrong_stream++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        uint8_t channel = sid & 0xFF;
+        if (channel > 1 || !(g_tx_config.enabled_tx_mask & (1 << channel))) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_disabled_ch++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        /* Skip header(4) + stream_id(4) + optional class_id(8) + timestamp(12).
+         * Our wire format always uses TSI=UTC + TSF=picoseconds. */
+        size_t payload_offset = 4 + 4 + (class_id_present ? 8 : 0) + 12;
+        size_t trailer_size = has_trailer ? 4 : 0;
+        if ((size_t)recv_len <= payload_offset + trailer_size) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_decode++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+        size_t payload_bytes = (size_t)recv_len - payload_offset - trailer_size;
+        if ((payload_bytes % 4) != 0) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_decode++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        size_t payload_int16s = payload_bytes / sizeof(int16_t);  /* I/Q interleaved */
+        int16_t *be_payload = (int16_t *)(recv_buf + payload_offset);
+
+        /* Locate the I channel of the target TX channel in the iio buffer.
+         * For single-channel TX, layout is contiguous [I,Q,I,Q,...] so we
+         * write straight in with no stride math. */
+        struct iio_channel *tx_i_ch = iio_device_find_channel(
+            tx_dev, channel == 0 ? "voltage0" : "voltage2", true);
+        if (!tx_i_ch) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.push_failures++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+        int16_t *tx_data = (int16_t *)iio_buffer_first(txbuf, tx_i_ch);
+        if (!tx_data) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.push_failures++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        size_t buf_capacity_int16 = DEFAULT_TX_BUFFER_SIZE * 2;  /* I+Q */
+        size_t to_copy = payload_int16s < buf_capacity_int16 ? payload_int16s : buf_capacity_int16;
+
+        for (size_t i = 0; i < to_copy; i++) {
+            tx_data[i] = (int16_t)ntohs(be_payload[i]);
+        }
+        /* Pad remainder with silence so the DAC doesn't replay stale samples. */
+        for (size_t i = to_copy; i < buf_capacity_int16; i++) {
+            tx_data[i] = 0;
+        }
+
+        ssize_t pushed = iio_buffer_push(txbuf);
+        if (pushed < 0) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.push_failures++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+        } else {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_transmitted++;
+            g_tx_stats.bytes_pushed += pushed;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+        }
+    }
+
+    close(tx_sock);
+    iio_buffer_destroy(txbuf);
+    printf("[TX] Stopped\n");
+    return NULL;
+}
+
+/* TX replay thread: stream raw int16 I/Q samples from a file to the
+ * DAC. Mutually exclusive with the UDP tx_thread; main() picks one. */
+static void *tx_replay_thread(void *arg) {
+    struct iio_context *ctx = (struct iio_context *)arg;
+    struct iio_device *tx_dev = NULL;
+
+    if (configure_tx(ctx, &tx_dev) < 0) {
+        fprintf(stderr, "[TX Replay] Hardware configuration failed\n");
+        return NULL;
+    }
+
+    struct iio_buffer *txbuf = iio_device_create_buffer(tx_dev, DEFAULT_TX_BUFFER_SIZE, false);
+    if (!txbuf) {
+        fprintf(stderr, "[TX Replay] iio_device_create_buffer failed\n");
+        return NULL;
+    }
+
+    int fd = open(g_tx_replay_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[TX Replay] Failed to open '%s': %s\n",
+                g_tx_replay_path, strerror(errno));
+        iio_buffer_destroy(txbuf);
+        return NULL;
+    }
+
+    /* Exactly one TX channel is enabled (CLI rejects both for replay v1). */
+    int channel = (g_tx_config.enabled_tx_mask & 0x01) ? 0 : 1;
+    struct iio_channel *tx_i_ch = iio_device_find_channel(
+        tx_dev, channel == 0 ? "voltage0" : "voltage2", true);
+    if (!tx_i_ch) {
+        fprintf(stderr, "[TX Replay] TX I channel not found\n");
+        close(fd);
+        iio_buffer_destroy(txbuf);
+        return NULL;
+    }
+
+    size_t buf_bytes = DEFAULT_TX_BUFFER_SIZE * 2 * sizeof(int16_t);  /* I+Q interleaved */
+    printf("[TX Replay] Streaming '%s' -> TX%d, %zu bytes/push%s\n",
+           g_tx_replay_path, channel, buf_bytes,
+           g_tx_replay_loop ? " (looping)" : "");
+
+    uint64_t buffers_pushed = 0;
+
+    while (g_running) {
+        int16_t *tx_data = (int16_t *)iio_buffer_first(txbuf, tx_i_ch);
+        if (!tx_data) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.push_failures++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            break;
+        }
+
+        /* Fill the iio buffer from disk. Handles short reads via a loop
+         * so a single buffer push always contains a full block. */
+        size_t filled = 0;
+        bool hit_eof = false;
+        while (filled < buf_bytes) {
+            ssize_t n = read(fd, (uint8_t *)tx_data + filled, buf_bytes - filled);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "[TX Replay] read() error: %s\n", strerror(errno));
+                close(fd);
+                iio_buffer_destroy(txbuf);
+                return NULL;
+            }
+            if (n == 0) {
+                hit_eof = true;
+                break;
+            }
+            filled += n;
+        }
+
+        if (hit_eof) {
+            if (filled == 0) {
+                /* Clean EOF on a buffer boundary */
+                if (!g_tx_replay_loop) {
+                    printf("[TX Replay] EOF (no --tx-loop), exiting after %llu buffers\n",
+                           (unsigned long long)buffers_pushed);
+                    break;
+                }
+                if (lseek(fd, 0, SEEK_SET) < 0) {
+                    fprintf(stderr, "[TX Replay] lseek failed: %s\n", strerror(errno));
+                    break;
+                }
+                continue;  /* re-read from start */
+            } else {
+                /* Partial buffer at EOF: pad with silence and push, then
+                 * either loop or exit on next iteration. */
+                memset((uint8_t *)tx_data + filled, 0, buf_bytes - filled);
+                if (g_tx_replay_loop) {
+                    if (lseek(fd, 0, SEEK_SET) < 0) {
+                        fprintf(stderr, "[TX Replay] lseek failed: %s\n", strerror(errno));
+                        break;
+                    }
+                }
+            }
+        }
+
+        ssize_t pushed = iio_buffer_push(txbuf);
+        if (pushed < 0) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.push_failures++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+        } else {
+            buffers_pushed++;
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_transmitted++;
+            g_tx_stats.bytes_pushed += pushed;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+        }
+
+        if (hit_eof && !g_tx_replay_loop) {
+            /* We just pushed the final partial buffer; exit. */
+            printf("[TX Replay] EOF reached, pushed final partial buffer (%zu bytes), exiting\n",
+                   filled);
+            break;
+        }
+    }
+
+    close(fd);
+    iio_buffer_destroy(txbuf);
+    printf("[TX Replay] Stopped (pushed %llu buffers)\n", (unsigned long long)buffers_pushed);
+    return NULL;
+}
+
 /* Main */
 int main(int argc, char **argv) {
     /* Parse command-line arguments for MTU */
@@ -1087,22 +1501,66 @@ int main(int argc, char **argv) {
                 return 1;
             }
             g_sdr_config.enabled_rx_mask = mask;
+        } else if (strcmp(argv[i], "--tx-channels") == 0 && i + 1 < argc) {
+            /* v1 supports a single TX channel at a time: "0" or "1". */
+            const char *spec = argv[++i];
+            uint8_t mask = 0;
+            for (const char *p = spec; *p; p++) {
+                if (*p == '0') mask |= 0x01;
+                else if (*p == '1') mask |= 0x02;
+            }
+            if (mask == 0) {
+                fprintf(stderr, "ERROR: --tx-channels must include 0 or 1 (got '%s')\n", spec);
+                return 1;
+            }
+            if (mask == 0x03) {
+                fprintf(stderr, "ERROR: dual TX (both channels) not supported in v1; pick one\n");
+                return 1;
+            }
+            g_tx_config.enabled_tx_mask = mask;
+        } else if (strcmp(argv[i], "--tx-freq") == 0 && i + 1 < argc) {
+            g_tx_config.center_freq_hz = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--tx-gain") == 0 && i + 1 < argc) {
+            g_tx_config.gain_db = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--tx-replay") == 0 && i + 1 < argc) {
+            g_tx_replay_path = argv[++i];
+        } else if (strcmp(argv[i], "--tx-loop") == 0) {
+            g_tx_replay_loop = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
             printf("  --jumbo                  Use jumbo frames (MTU 9000)\n");
             printf("  --mtu <size>             Set custom MTU size in bytes\n");
-            printf("  --rx-channels <list>     Comma-separated RX channels: 0, 1, or 0,1\n");
-            printf("                           (default: 0). Streams emit on port %d with\n", DATA_PORT);
-            printf("                           stream_id 0x0100000N where N=channel.\n");
-            printf("  --help, -h               Show this help message\n");
+            printf("  --rx-channels <list>     RX channels: 0, 1, or 0,1 (default: 0)\n");
+            printf("                           Emits on port %d with stream_id 0x0100000N.\n", DATA_PORT);
+            printf("  --tx-channels <list>     TX channel: 0 or 1 (default: TX disabled)\n");
+            printf("                           v1: one channel at a time.\n");
+            printf("  --tx-freq <hz>           TX center frequency (default: %llu)\n",
+                   (unsigned long long)DEFAULT_FREQ_HZ);
+            printf("  --tx-gain <db>           TX gain in dB; AD9361 TX is attenuation,\n");
+            printf("                           range -89.75..0 (default: %.1f)\n", DEFAULT_TX_GAIN_DB);
+            printf("\nTX source (pick one when TX is enabled):\n");
+            printf("  (default)                Listen on UDP port %d for VITA-49 IF Data\n", TX_DATA_PORT);
+            printf("                           packets with stream_id 0x0200000N\n");
+            printf("  --tx-replay <path>       Stream raw int16 I/Q (interleaved, little-endian,\n");
+            printf("                           no header) from a file instead of UDP\n");
+            printf("  --tx-loop                With --tx-replay, restart from the beginning on EOF\n");
+            printf("\n  --help, -h               Show this help message\n");
             printf("\nExamples:\n");
-            printf("  %s                       # Single RX0 (default, backward-compat)\n", argv[0]);
-            printf("  %s --rx-channels 0,1     # Dual RX, both channels on port %d\n", argv[0], DATA_PORT);
-            printf("  %s --rx-channels 1       # RX1 only\n", argv[0]);
-            printf("  %s --jumbo               # Jumbo frames (9000 bytes)\n", argv[0]);
+            printf("  %s                                          # Single RX0 (default)\n", argv[0]);
+            printf("  %s --rx-channels 0,1                        # Dual RX on port %d\n", argv[0], DATA_PORT);
+            printf("  %s --tx-channels 0 --tx-freq 915000000      # TX0 from UDP at 915 MHz\n", argv[0]);
+            printf("  %s --tx-channels 0 --tx-replay tone.iq16le --tx-loop  # Replay loop\n", argv[0]);
             return 0;
         }
+    }
+
+    /* Replay-mode validation. Replay requires exactly one TX channel and
+     * is mutually exclusive with the UDP TX path (we just don't spawn the
+     * UDP recv when replay is set). */
+    if (g_tx_replay_path != NULL && g_tx_config.enabled_tx_mask == 0) {
+        fprintf(stderr, "ERROR: --tx-replay requires --tx-channels to be set\n");
+        return 1;
     }
 
     /* Calculate optimal packet size based on MTU */
@@ -1135,6 +1593,7 @@ int main(int argc, char **argv) {
 
     /* Initialize statistics mutex */
     pthread_mutex_init(&g_stats.mutex, NULL);
+    pthread_mutex_init(&g_tx_stats.mutex, NULL);
 
     /* Create IIO context */
     struct iio_context *ctx = iio_create_local_context();
@@ -1173,10 +1632,23 @@ int main(int argc, char **argv) {
     printf("Data port: %d\n\n", DATA_PORT);
 
     /* Start threads */
-    pthread_t control_tid, streaming_tid;
+    pthread_t control_tid, streaming_tid, tx_tid;
+    bool tx_thread_started = false;
 
     pthread_create(&control_tid, NULL, control_thread, &control_sock);
     pthread_create(&streaming_tid, NULL, streaming_thread, ctx);
+
+    if (g_tx_config.enabled_tx_mask != 0) {
+        void *(*entry)(void *) = (g_tx_replay_path != NULL) ? tx_replay_thread : tx_thread;
+        if (pthread_create(&tx_tid, NULL, entry, ctx) == 0) {
+            tx_thread_started = true;
+            printf("TX thread started (tx_mask=0x%02X, source=%s)\n",
+                   g_tx_config.enabled_tx_mask,
+                   g_tx_replay_path != NULL ? "file replay" : "UDP");
+        } else {
+            fprintf(stderr, "ERROR: Failed to start TX thread\n");
+        }
+    }
 
     /* Monitor */
     while (g_running) {
@@ -1212,6 +1684,23 @@ int main(int argc, char **argv) {
                (unsigned long long)min_loop,
                (unsigned long long)max_loop);
 
+        if (g_tx_config.enabled_tx_mask != 0) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            uint64_t tx_rx = g_tx_stats.packets_received;
+            uint64_t tx_tx = g_tx_stats.packets_transmitted;
+            uint64_t tx_ws = g_tx_stats.packets_dropped_wrong_stream;
+            uint64_t tx_dc = g_tx_stats.packets_dropped_disabled_ch;
+            uint64_t tx_dec = g_tx_stats.packets_dropped_decode;
+            uint64_t tx_pf = g_tx_stats.push_failures;
+            uint64_t tx_bytes = g_tx_stats.bytes_pushed;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            printf("[TX] Recv: %llu, Tx: %llu, Drops(wrong_sid=%llu, disabled_ch=%llu, decode=%llu), PushFails: %llu, Bytes: %llu\n",
+                   (unsigned long long)tx_rx, (unsigned long long)tx_tx,
+                   (unsigned long long)tx_ws, (unsigned long long)tx_dc,
+                   (unsigned long long)tx_dec, (unsigned long long)tx_pf,
+                   (unsigned long long)tx_bytes);
+        }
+
         /* Detailed subscriber statistics */
         printf("\n[Subscribers] Active: %d/%d\n", g_subscriber_count, MAX_SUBSCRIBERS);
         pthread_mutex_lock(&g_subscribers_mutex);
@@ -1239,10 +1728,14 @@ int main(int argc, char **argv) {
     /* Cleanup */
     pthread_join(control_tid, NULL);
     pthread_join(streaming_tid, NULL);
+    if (tx_thread_started) {
+        pthread_join(tx_tid, NULL);
+    }
 
     close(control_sock);
     iio_context_destroy(ctx);
     pthread_mutex_destroy(&g_stats.mutex);
+    pthread_mutex_destroy(&g_tx_stats.mutex);
 
     printf("\n✓ Stopped\n");
     return 0;
