@@ -67,6 +67,12 @@
 #define VRT_TSI_UTC             0x1             /* UTC timestamp */
 #define VRT_TSF_PICOSECONDS     0x2             /* Picosecond fractional time */
 
+/* Stream IDs. High byte 0x01 = RX, low byte = channel index.
+ * (TX will use 0x02xx in Phase 5.) Preserves backward-compat with
+ * existing consumers that filter on RX0_STREAM_ID. */
+#define RX0_STREAM_ID           0x01000000
+#define RX1_STREAM_ID           0x01000001
+
 /* Global state */
 static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -97,6 +103,9 @@ typedef struct {
     uint32_t sample_rate_hz;
     uint32_t bandwidth_hz;
     double gain_db;
+    /* Bit 0 = RX0 enabled, bit 1 = RX1 enabled. Default 0b01 keeps
+     * the binary's behavior bit-identical for single-RX deployments. */
+    uint8_t enabled_rx_mask;
     bool config_changed;  /* Flag to signal streaming thread to reconfigure */
     pthread_mutex_t mutex;
 } sdr_config_t;
@@ -106,6 +115,7 @@ static sdr_config_t g_sdr_config = {
     .sample_rate_hz = DEFAULT_RATE_HZ,
     .bandwidth_hz = DEFAULT_RATE_HZ * 0.8,
     .gain_db = DEFAULT_GAIN_DB,
+    .enabled_rx_mask = 0x01,
     .config_changed = false,
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
@@ -165,8 +175,8 @@ static void cleanup_dead_subscribers(void);
 static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len);
 static uint64_t get_timestamp_us(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
-static void encode_context_packet(uint8_t *buf, size_t *len);
-static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count);
+static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id);
+static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint32_t stream_id);
 static void *control_thread(void *arg);
 static void *streaming_thread(void *arg);
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
@@ -367,8 +377,8 @@ static void broadcast_to_subscribers(int sock, uint8_t *buf, size_t len) {
     pthread_mutex_unlock(&g_subscribers_mutex);
 }
 
-/* Encode VITA49 Context packet */
-static void encode_context_packet(uint8_t *buf, size_t *len) {
+/* Encode VITA49 Context packet for the given stream_id (channel). */
+static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id) {
     vrt_context_header_t *hdr = (vrt_context_header_t *)buf;
     uint8_t *payload = buf + sizeof(vrt_context_header_t);
     size_t payload_len = 0;
@@ -474,7 +484,7 @@ static void encode_context_packet(uint8_t *buf, size_t *len) {
     header |= (total_words & 0xFFFF);
 
     hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(0x01000000);
+    hdr->stream_id = htonl_custom(stream_id);
     hdr->timestamp_int = htonl_custom(ts_int);
     hdr->timestamp_frac = htonll(ts_frac);
     hdr->cif = htonl_custom(cif);
@@ -723,7 +733,7 @@ static void *streaming_thread(void *arg) {
 
     printf("[Streaming] Started\n");
 
-    uint8_t packet_count = 0;
+    uint8_t packet_count[2] = {0, 0};  /* Per-channel 4-bit VRT packet counter */
     int packets_since_context = 0;
     uint64_t packets_sent = 0;
     static uint8_t packet_buf[MAX_PACKET_BUFFER];  /* Static to avoid stack overflow with large buffer */
@@ -783,12 +793,23 @@ static void *streaming_thread(void *arg) {
                 g_sdr_config.config_changed = false;
                 pthread_mutex_unlock(&g_sdr_config.mutex);
 
-                /* Send Context packet to notify all subscribers of the change */
-                encode_context_packet(packet_buf, &packet_len);
-                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
-                pthread_mutex_lock(&g_stats.mutex);
-                g_stats.contexts_sent++;
-                pthread_mutex_unlock(&g_stats.mutex);
+                /* Send Context packet to notify all subscribers of the change.
+                 * One context per enabled RX channel so consumers can associate
+                 * each data stream with its own config. */
+                if (g_sdr_config.enabled_rx_mask & 0x01) {
+                    encode_context_packet(packet_buf, &packet_len, RX0_STREAM_ID);
+                    broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                    pthread_mutex_lock(&g_stats.mutex);
+                    g_stats.contexts_sent++;
+                    pthread_mutex_unlock(&g_stats.mutex);
+                }
+                if (g_sdr_config.enabled_rx_mask & 0x02) {
+                    encode_context_packet(packet_buf, &packet_len, RX1_STREAM_ID);
+                    broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                    pthread_mutex_lock(&g_stats.mutex);
+                    g_stats.contexts_sent++;
+                    pthread_mutex_unlock(&g_stats.mutex);
+                }
 
                 printf("[Streaming] Configuration applied successfully\n");
                 printf("[Streaming] Notified %d subscribers of config change\n", g_subscriber_count);
@@ -815,11 +836,25 @@ static void *streaming_thread(void *arg) {
             continue;
         }
 
-        /* Get pointer to data */
+        /* Snapshot the active channel mask once per buffer so the math
+         * below stays consistent even if a reconfig races in. */
+        uint8_t mask;
+        pthread_mutex_lock(&g_sdr_config.mutex);
+        mask = g_sdr_config.enabled_rx_mask;
+        pthread_mutex_unlock(&g_sdr_config.mutex);
+        int active_channels = ((mask & 0x01) ? 1 : 0) + ((mask & 0x02) ? 1 : 0);
+        if (active_channels == 0) {
+            usleep(1000);
+            continue;
+        }
+
+        /* Get pointer to data. libiio packs all enabled channels into a
+         * single interleaved buffer with stride = active_channels * 4
+         * bytes per frame. */
         int16_t *samples = (int16_t *)iio_buffer_first(rxbuf, iio_device_get_channel(dev, 0));
         if (!samples) continue;
 
-        size_t num_samples = nbytes / (2 * sizeof(int16_t));  /* IQ pairs */
+        size_t num_samples = nbytes / (active_channels * 2 * sizeof(int16_t));  /* IQ pairs per channel */
 
         /* Timestamp discontinuity detection */
         uint64_t current_ts = get_timestamp_us();
@@ -853,32 +888,79 @@ static void *streaming_thread(void *arg) {
         g_stats.last_timestamp_us = current_ts;
         pthread_mutex_unlock(&g_stats.mutex);
 
-        /* Send context packet periodically */
+        /* Send context packet periodically (one per enabled channel) */
         if (packets_since_context >= CONTEXT_INTERVAL) {
-            encode_context_packet(packet_buf, &packet_len);
-            broadcast_to_subscribers(data_sock, packet_buf, packet_len);
-            pthread_mutex_lock(&g_stats.mutex);
-            g_stats.contexts_sent++;
-            pthread_mutex_unlock(&g_stats.mutex);
+            if (g_sdr_config.enabled_rx_mask & 0x01) {
+                encode_context_packet(packet_buf, &packet_len, RX0_STREAM_ID);
+                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                pthread_mutex_lock(&g_stats.mutex);
+                g_stats.contexts_sent++;
+                pthread_mutex_unlock(&g_stats.mutex);
+            }
+            if (g_sdr_config.enabled_rx_mask & 0x02) {
+                encode_context_packet(packet_buf, &packet_len, RX1_STREAM_ID);
+                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                pthread_mutex_lock(&g_stats.mutex);
+                g_stats.contexts_sent++;
+                pthread_mutex_unlock(&g_stats.mutex);
+            }
             packets_since_context = 0;
         }
 
-        /* Packetize and send */
+        /* Packetize and send. For single-channel, the buffer layout
+         * [I,Q,I,Q,...] feeds straight into encode_data_packet. For
+         * dual-channel, [I0,Q0,I1,Q1,...] is deinterleaved per chunk
+         * into two staging buffers and emitted as two packets (same
+         * destination UDP port, distinct stream_ids). */
+        static int16_t ch0_chunk[MAX_PACKET_BUFFER / 2];
+        static int16_t ch1_chunk[MAX_PACKET_BUFFER / 2];
+
         for (size_t offset = 0; offset < num_samples; offset += g_samples_per_packet) {
             size_t chunk_size = (offset + g_samples_per_packet > num_samples) ?
                                (num_samples - offset) : g_samples_per_packet;
 
-            encode_data_packet(packet_buf, &packet_len, samples + offset * 2,
-                             chunk_size, &packet_count);
+            if (active_channels == 1) {
+                uint32_t sid = (mask & 0x01) ? RX0_STREAM_ID : RX1_STREAM_ID;
+                int slot = (mask & 0x01) ? 0 : 1;
+                encode_data_packet(packet_buf, &packet_len, samples + offset * 2,
+                                   chunk_size, &packet_count[slot], sid);
+                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
 
-            broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                pthread_mutex_lock(&g_stats.mutex);
+                g_stats.packets_sent++;
+                g_stats.bytes_sent += packet_len;
+                pthread_mutex_unlock(&g_stats.mutex);
+                packets_since_context++;
+                packets_sent++;
+            } else {
+                /* Deinterleave one chunk: 4 int16s per frame -> 2 channels x 2 int16s */
+                for (size_t i = 0; i < chunk_size; i++) {
+                    size_t f = (offset + i) * 4;
+                    ch0_chunk[i * 2]     = samples[f + 0];
+                    ch0_chunk[i * 2 + 1] = samples[f + 1];
+                    ch1_chunk[i * 2]     = samples[f + 2];
+                    ch1_chunk[i * 2 + 1] = samples[f + 3];
+                }
 
-            pthread_mutex_lock(&g_stats.mutex);
-            g_stats.packets_sent++;
-            g_stats.bytes_sent += packet_len;
-            pthread_mutex_unlock(&g_stats.mutex);
-            packets_since_context++;
-            packets_sent++;
+                encode_data_packet(packet_buf, &packet_len, ch0_chunk,
+                                   chunk_size, &packet_count[0], RX0_STREAM_ID);
+                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                pthread_mutex_lock(&g_stats.mutex);
+                g_stats.packets_sent++;
+                g_stats.bytes_sent += packet_len;
+                pthread_mutex_unlock(&g_stats.mutex);
+
+                encode_data_packet(packet_buf, &packet_len, ch1_chunk,
+                                   chunk_size, &packet_count[1], RX1_STREAM_ID);
+                broadcast_to_subscribers(data_sock, packet_buf, packet_len);
+                pthread_mutex_lock(&g_stats.mutex);
+                g_stats.packets_sent++;
+                g_stats.bytes_sent += packet_len;
+                pthread_mutex_unlock(&g_stats.mutex);
+
+                packets_since_context += 2;
+                packets_sent += 2;
+            }
         }
 
         /* Loop timing measurements */
@@ -936,17 +1018,44 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
         iio_channel_attr_write(ch, "gain_control_mode", "manual");
     }
 
-    /* Enable channels */
+    /* RX1 gain (phy voltage1, is_output=false). Same gain as RX0 today;
+     * a future revision can split per-channel gain into its own field. */
+    if (g_sdr_config.enabled_rx_mask & 0x02) {
+        struct iio_channel *phy_rx1 = iio_device_find_channel(phy, "voltage1", false);
+        if (phy_rx1) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.1f", g_sdr_config.gain_db);
+            iio_channel_attr_write(phy_rx1, "hardwaregain", buf);
+            iio_channel_attr_write(phy_rx1, "gain_control_mode", "manual");
+        }
+    }
+
+    /* Enable channels per mask. RX0 = voltage0/voltage1, RX1 = voltage2/voltage3. */
     struct iio_channel *rx0_i = iio_device_find_channel(dev, "voltage0", false);
     struct iio_channel *rx0_q = iio_device_find_channel(dev, "voltage1", false);
+    struct iio_channel *rx1_i = iio_device_find_channel(dev, "voltage2", false);
+    struct iio_channel *rx1_q = iio_device_find_channel(dev, "voltage3", false);
 
-    if (rx0_i) iio_channel_enable(rx0_i);
-    if (rx0_q) iio_channel_enable(rx0_q);
+    if (g_sdr_config.enabled_rx_mask & 0x01) {
+        if (rx0_i) iio_channel_enable(rx0_i);
+        if (rx0_q) iio_channel_enable(rx0_q);
+    } else {
+        if (rx0_i) iio_channel_disable(rx0_i);
+        if (rx0_q) iio_channel_disable(rx0_q);
+    }
+    if (g_sdr_config.enabled_rx_mask & 0x02) {
+        if (rx1_i) iio_channel_enable(rx1_i);
+        if (rx1_q) iio_channel_enable(rx1_q);
+    } else {
+        if (rx1_i) iio_channel_disable(rx1_i);
+        if (rx1_q) iio_channel_disable(rx1_q);
+    }
 
-    printf("[Config] Configured: %.1f MHz, %.1f MSPS, %.1f dB\n",
+    printf("[Config] Configured: %.1f MHz, %.1f MSPS, %.1f dB, rx_mask=0x%02X\n",
            g_sdr_config.center_freq_hz / 1e6,
            g_sdr_config.sample_rate_hz / 1e6,
-           g_sdr_config.gain_db);
+           g_sdr_config.gain_db,
+           g_sdr_config.enabled_rx_mask);
 
     pthread_mutex_unlock(&g_sdr_config.mutex);
 
@@ -965,16 +1074,33 @@ int main(int argc, char **argv) {
             mtu = MTU_JUMBO;
         } else if (strcmp(argv[i], "--mtu") == 0 && i + 1 < argc) {
             mtu = (size_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--rx-channels") == 0 && i + 1 < argc) {
+            /* Accepts "0", "1", or "0,1". Bit 0=RX0, bit 1=RX1. */
+            const char *spec = argv[++i];
+            uint8_t mask = 0;
+            for (const char *p = spec; *p; p++) {
+                if (*p == '0') mask |= 0x01;
+                else if (*p == '1') mask |= 0x02;
+            }
+            if (mask == 0) {
+                fprintf(stderr, "ERROR: --rx-channels must include 0 or 1 (got '%s')\n", spec);
+                return 1;
+            }
+            g_sdr_config.enabled_rx_mask = mask;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
-            printf("  --jumbo           Use jumbo frames (MTU 9000)\n");
-            printf("  --mtu <size>      Set custom MTU size in bytes\n");
-            printf("  --help, -h        Show this help message\n");
+            printf("  --jumbo                  Use jumbo frames (MTU 9000)\n");
+            printf("  --mtu <size>             Set custom MTU size in bytes\n");
+            printf("  --rx-channels <list>     Comma-separated RX channels: 0, 1, or 0,1\n");
+            printf("                           (default: 0). Streams emit on port %d with\n", DATA_PORT);
+            printf("                           stream_id 0x0100000N where N=channel.\n");
+            printf("  --help, -h               Show this help message\n");
             printf("\nExamples:\n");
-            printf("  %s                # Standard MTU (1500 bytes)\n", argv[0]);
-            printf("  %s --jumbo        # Jumbo frames (9000 bytes)\n", argv[0]);
-            printf("  %s --mtu 1492     # PPPoE MTU\n", argv[0]);
+            printf("  %s                       # Single RX0 (default, backward-compat)\n", argv[0]);
+            printf("  %s --rx-channels 0,1     # Dual RX, both channels on port %d\n", argv[0], DATA_PORT);
+            printf("  %s --rx-channels 1       # RX1 only\n", argv[0]);
+            printf("  %s --jumbo               # Jumbo frames (9000 bytes)\n", argv[0]);
             return 0;
         }
     }
