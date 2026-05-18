@@ -492,9 +492,9 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id)
     *len = sizeof(vrt_context_header_t) + payload_len;
 }
 
-/* Encode VITA49 Data packet */
+/* Encode VITA49 Data packet for the given stream_id (channel). */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
-                               size_t num_samples, uint8_t *packet_count) {
+                               size_t num_samples, uint8_t *packet_count, uint32_t stream_id) {
     /* Validate buffer won't overflow */
     size_t required_size = sizeof(vrt_data_header_t) +
                           (num_samples * 2 * sizeof(int16_t)) +
@@ -546,7 +546,7 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
     header |= (total_words & 0xFFFF);
 
     hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(0x01000000);
+    hdr->stream_id = htonl_custom(stream_id);
     hdr->timestamp_int = htonl_custom(ts_int);
     hdr->timestamp_frac = htonll(ts_frac);
 
