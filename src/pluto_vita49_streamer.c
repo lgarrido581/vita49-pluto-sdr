@@ -95,11 +95,21 @@ static volatile bool g_running = true;
 static pthread_mutex_t g_subscribers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_samples_per_packet = 360;  /* Will be calculated at runtime based on MTU */
 
-/* Monotonic config generation. Bumped by the control thread when a
- * reconfig context arrives with a new epoch (or when the local config
- * changes in a way that should invalidate in-flight samples). Streaming
- * threads read this and stamp it on every outbound packet via Class ID. */
+/* Monotonic config generation. Stamped on every outbound data packet via
+ * Class ID. Updated ONLY by the streaming thread, after it has destroyed
+ * the buffer that may contain pre-reconfig samples — see g_pending_epoch
+ * below. Reading the value from the streaming thread therefore needs no
+ * mutex; the control thread should not write it directly. */
 static volatile uint16_t g_current_epoch = 0;
+
+/* Staged epoch the control thread requests on receipt of a new context
+ * packet. The streaming thread copies pending->current ONLY after it has
+ * (a) destroyed the in-flight buffer, (b) reconfigured the hardware, and
+ * (c) created the fresh buffer. This guarantees that no packet built
+ * from pre-reconfig samples ever carries the new epoch tag — which was
+ * the source of the bleed-over the control-thread update used to cause.
+ * 0 = "no pending change". Protected by g_sdr_config.mutex. */
+static uint16_t g_pending_epoch = 0;
 
 /* Subscriber list */
 typedef struct {
@@ -786,21 +796,23 @@ static void *control_thread(void *arg) {
                 changed = true;
             }
 
-            /* Epoch handling: a client-provided epoch becomes the new
-             * g_current_epoch. If no epoch was tagged but something
-             * changed, auto-bump so consumers can still distinguish
-             * pre- and post-reconfig samples. */
+            /* Epoch handling: STAGE the new epoch into g_pending_epoch.
+             * The streaming thread will commit it to g_current_epoch only
+             * AFTER it has destroyed the buffer holding pre-reconfig
+             * samples — otherwise old IQ would ship out tagged with the
+             * new epoch and consumers would mistake stale samples for
+             * fresh ones from the new tune. */
             if (client_epoch != 0 && client_epoch != g_current_epoch) {
-                printf("[Control] Epoch: %u -> %u (client-tagged)\n",
+                printf("[Control] Epoch: %u -> %u (client-tagged, pending apply)\n",
                        (unsigned)g_current_epoch, (unsigned)client_epoch);
-                g_current_epoch = client_epoch;
+                g_pending_epoch = client_epoch;
                 changed = true;  /* force flush even if no other field changed */
             } else if (changed && client_epoch == 0) {
                 uint16_t bumped = g_current_epoch + 1;
                 if (bumped == 0) bumped = 1;  /* skip 0 = "untagged" sentinel */
-                printf("[Control] Epoch: %u -> %u (auto-bumped on reconfig)\n",
+                printf("[Control] Epoch: %u -> %u (auto-bumped on reconfig, pending apply)\n",
                        (unsigned)g_current_epoch, (unsigned)bumped);
-                g_current_epoch = bumped;
+                g_pending_epoch = bumped;
             }
 
             /* Set flag to notify streaming thread to apply changes */
@@ -871,7 +883,6 @@ static void *streaming_thread(void *arg) {
     uint64_t packets_sent = 0;
     static uint8_t packet_buf[MAX_PACKET_BUFFER];  /* Static to avoid stack overflow with large buffer */
     size_t packet_len;
-    uint64_t last_config_check_us = get_timestamp_us();
 
     while (g_running) {
         /* Periodic cleanup of dead subscribers */
@@ -879,11 +890,13 @@ static void *streaming_thread(void *arg) {
             cleanup_dead_subscribers();
         }
 
-        /* Check for configuration changes every 100ms */
-        uint64_t now_us = get_timestamp_us();
-        if (now_us - last_config_check_us >= 100000) {  /* 100ms = 100,000 microseconds */
-            last_config_check_us = now_us;
-
+        /* Check for configuration changes EVERY iteration. The 100ms
+         * cadence we used before this fix meant up to 100ms of pre-reconfig
+         * samples shipped out tagged with the new epoch — see the
+         * g_pending_epoch comment block. Checking inline is cheap (one
+         * mutex lock); the throttle stays around the heavy work itself,
+         * not around the visibility of the change. */
+        {
             pthread_mutex_lock(&g_sdr_config.mutex);
             bool needs_reconfig = g_sdr_config.config_changed;
             pthread_mutex_unlock(&g_sdr_config.mutex);
@@ -921,9 +934,21 @@ static void *streaming_thread(void *arg) {
                     break;
                 }
 
-                /* Clear the flag */
+                /* Commit the staged epoch NOW, after the pre-reconfig
+                 * buffer has been destroyed and the hardware is on the
+                 * new tune. Any subsequent encode_data_packet() call will
+                 * read this new value and tag its packets with it; any
+                 * packets already shipped (from the now-destroyed buffer)
+                 * still carry the OLD epoch — exactly what we want, so
+                 * consumers can distinguish pre- from post-reconfig IQ. */
                 pthread_mutex_lock(&g_sdr_config.mutex);
                 g_sdr_config.config_changed = false;
+                if (g_pending_epoch != 0 && g_pending_epoch != g_current_epoch) {
+                    printf("[Streaming] Epoch applied: %u -> %u\n",
+                           (unsigned)g_current_epoch, (unsigned)g_pending_epoch);
+                    g_current_epoch = g_pending_epoch;
+                    g_pending_epoch = 0;
+                }
                 pthread_mutex_unlock(&g_sdr_config.mutex);
 
                 /* Send Context packet to notify all subscribers of the change.
@@ -1135,15 +1160,41 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
         iio_channel_attr_write(ch, "frequency", buf);
     }
 
-    /* Set sample rate */
+    /* Set sample rate, then read it back. AD9361 has discrete supported
+     * rates (~521 kSPS minimum, FIR/CIC decimation constraints) and the
+     * driver silently clamps unsupported requests. If we keep advertising
+     * the *requested* rate in VITA49 context packets while the chip is
+     * actually streaming at a different rate, downstream FM/AM demod
+     * timing breaks (audio plays too fast or too slow) and excision
+     * filters end up at the wrong cutoffs. Mirror the same read-back for
+     * rf_bandwidth so the analog filter cutoff in the context packet is
+     * also the value the chip actually applied. */
     ch = iio_device_find_channel(phy, "voltage0", false);
     if (ch) {
-        char buf[32];
+        char buf[64];
         snprintf(buf, sizeof(buf), "%u", g_sdr_config.sample_rate_hz);
         iio_channel_attr_write(ch, "sampling_frequency", buf);
+        if (iio_channel_attr_read(ch, "sampling_frequency", buf, sizeof(buf)) > 0) {
+            long long actual_rate = atoll(buf);
+            if (actual_rate > 0 && (uint32_t)actual_rate != g_sdr_config.sample_rate_hz) {
+                printf("[Config] sample rate clamped: requested %u Hz, "
+                       "AD9361 applied %lld Hz\n",
+                       g_sdr_config.sample_rate_hz, actual_rate);
+                g_sdr_config.sample_rate_hz = (uint32_t)actual_rate;
+            }
+        }
 
         snprintf(buf, sizeof(buf), "%u", g_sdr_config.bandwidth_hz);
         iio_channel_attr_write(ch, "rf_bandwidth", buf);
+        if (iio_channel_attr_read(ch, "rf_bandwidth", buf, sizeof(buf)) > 0) {
+            long long actual_bw = atoll(buf);
+            if (actual_bw > 0 && (uint32_t)actual_bw != g_sdr_config.bandwidth_hz) {
+                printf("[Config] rf_bandwidth clamped: requested %u Hz, "
+                       "AD9361 applied %lld Hz\n",
+                       g_sdr_config.bandwidth_hz, actual_bw);
+                g_sdr_config.bandwidth_hz = (uint32_t)actual_bw;
+            }
+        }
 
         snprintf(buf, sizeof(buf), "%.1f", g_sdr_config.gain_db);
         iio_channel_attr_write(ch, "hardwaregain", buf);
