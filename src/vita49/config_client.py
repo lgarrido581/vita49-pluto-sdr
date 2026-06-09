@@ -11,6 +11,9 @@ Usage:
 
     # Quick reconfigure (change only frequency)
     python vita49_config_client.py --pluto 192.168.2.1 --freq 2.4e9
+
+    # Use fixed client port to avoid creating duplicate subscribers
+    python vita49_config_client.py --pluto 192.168.2.1 --freq 2.4e9 --client-port 50000
 """
 
 import argparse
@@ -24,16 +27,35 @@ class VITA49ConfigClient:
     Send configuration to Pluto via VITA49 Context packets.
     """
 
-    def __init__(self, pluto_ip, control_port=4990, data_port=4991):
+    def __init__(self, pluto_ip, control_port=4990, data_port=4991, client_port=0):
         self.pluto_ip = pluto_ip
         self.control_port = control_port
         self.data_port = data_port
         self.stream_id = 0x01000000  # Match server default
+        self.client_port = client_port  # Port to bind locally (0 = ephemeral)
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Bind to specific port to avoid creating new subscribers on each run
+        # Allow port reuse so we can quickly restart the client
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+            self.socket.bind(('', self.client_port))
+        except OSError as e:
+            # If port is already in use (e.g., stream handler listening), that's OK
+            # We can still send packets. Pluto will see our source port and respond there.
+            if self.client_port != 0:
+                import warnings
+                warnings.warn(f"Could not bind to port {self.client_port}: {e}. "
+                            f"Using ephemeral port instead. Config will still work.")
+                # Try binding to ephemeral port as fallback
+                self.socket.bind(('', 0))
+                self.client_port = self.socket.getsockname()[1]
+            else:
+                raise
 
     def encode_context(self, sample_rate_hz=None, center_freq_hz=None,
-                      bandwidth_hz=None, gain_db=None):
+                      bandwidth_hz=None, gain_db=None, channel_mode=None):
         """
         Encode VITA49 Context packet with configuration.
 
@@ -42,6 +64,7 @@ class VITA49ConfigClient:
             center_freq_hz: Center frequency in Hz (optional)
             bandwidth_hz: Bandwidth in Hz (optional)
             gain_db: RX gain in dB (optional)
+            channel_mode: Channel mode 0=RX0, 1=RX1, 2=DUAL (optional)
 
         Returns:
             bytes ready for UDP transmission
@@ -75,6 +98,11 @@ class VITA49ConfigClient:
             cif |= (1 << 21)  # Sample Rate
             context_fields.append(encode_hz(sample_rate_hz))
 
+        if channel_mode is not None:
+            cif |= (1 << 16)  # Channel Mode (custom extension)
+            # Encode as 32-bit field: 1 byte mode + 3 bytes padding
+            context_fields.append(struct.pack('>I', (channel_mode & 0xFF) << 24))
+
         # Calculate packet size
         field_bytes = b''.join(context_fields)
         field_words = len(field_bytes) // 4
@@ -97,7 +125,7 @@ class VITA49ConfigClient:
         ])
 
     def configure(self, sample_rate_hz=None, center_freq_hz=None,
-                 bandwidth_hz=None, gain_db=None):
+                 bandwidth_hz=None, gain_db=None, channel_mode=None):
         """
         Send configuration to Pluto.
 
@@ -113,7 +141,8 @@ class VITA49ConfigClient:
             sample_rate_hz=sample_rate_hz,
             center_freq_hz=center_freq_hz,
             bandwidth_hz=bandwidth_hz,
-            gain_db=gain_db
+            gain_db=gain_db,
+            channel_mode=channel_mode
         )
 
         try:
@@ -130,6 +159,9 @@ class VITA49ConfigClient:
                 print(f"  Bandwidth:   {bandwidth_hz/1e6:.1f} MHz")
             if gain_db is not None:
                 print(f"  Gain:        {gain_db} dB")
+            if channel_mode is not None:
+                mode_names = {0: "RX0", 1: "RX1", 2: "DUAL"}
+                print(f"  Channel Mode: {mode_names.get(channel_mode, 'UNKNOWN')}")
 
             print(f"\nPluto will now stream to this PC on UDP port {self.data_port}")
             return True
@@ -158,6 +190,12 @@ Examples:
 
   # Adjust gain only
   python vita49_config_client.py --pluto 192.168.2.1 --gain 20
+
+  # Enable dual-channel mode
+  python vita49_config_client.py --pluto 192.168.2.1 --channels 2
+
+  # Use fixed port to prevent duplicate subscribers (recommended)
+  python vita49_config_client.py --pluto 192.168.2.1 --freq 2.4e9 --client-port 50000
 
 After sending config, Pluto will stream IQ samples to your PC.
 Use a receiver script to capture and process the data.
@@ -205,13 +243,26 @@ Use a receiver script to capture and process the data.
         default=4991,
         help="Data port (default: 4991)"
     )
+    parser.add_argument(
+        '--client-port',
+        type=int,
+        default=0,
+        help="Local port to bind (default: 0 = random). Use fixed port to avoid duplicate subscribers."
+    )
+    parser.add_argument(
+        '--channels', '-c',
+        type=int,
+        choices=[0, 1, 2],
+        default=None,
+        help="Channel mode: 0=RX0 only, 1=RX1 only, 2=DUAL (both channels)"
+    )
 
     args = parser.parse_args()
 
     # Check that at least one parameter is specified
-    if not any([args.freq, args.rate, args.gain, args.bandwidth]):
+    if not any([args.freq, args.rate, args.gain, args.bandwidth, args.channels is not None]):
         print("ERROR: Must specify at least one configuration parameter")
-        print("       (--freq, --rate, --gain, or --bandwidth)")
+        print("       (--freq, --rate, --gain, --bandwidth, or --channels)")
         return 1
 
     print("="*60)
@@ -224,7 +275,8 @@ Use a receiver script to capture and process the data.
     client = VITA49ConfigClient(
         pluto_ip=args.pluto,
         control_port=args.control_port,
-        data_port=args.data_port
+        data_port=args.data_port,
+        client_port=args.client_port
     )
 
     # Send configuration
@@ -232,7 +284,8 @@ Use a receiver script to capture and process the data.
         sample_rate_hz=args.rate,
         center_freq_hz=args.freq,
         bandwidth_hz=args.bandwidth,
-        gain_db=args.gain
+        gain_db=args.gain,
+        channel_mode=args.channels
     )
 
     client.close()

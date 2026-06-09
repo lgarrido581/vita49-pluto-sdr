@@ -26,13 +26,22 @@ nodeids
 *~
 
 # Build artifacts
-vita49_streamer
 *.o
 *.a
 *.exe
 *.dll
 *.so
 *.dylib
+vita49_streamer
+iio_buffer_diagnostic
+
+# Claude internal
+.claude/plans/
+.claude/settings.local.json
+
+# External build artifacts
+linuxptp-arm*
+build/
 
 # OS
 .DS_Store

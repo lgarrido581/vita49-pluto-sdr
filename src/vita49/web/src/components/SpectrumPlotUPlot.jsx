@@ -10,6 +10,7 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
   const [maxHoldEnabled, setMaxHoldEnabled] = useState(false)
   const [maxHoldData, setMaxHoldData] = useState(null)
   const [plotReady, setPlotReady] = useState(false)
+  const lastVisibleTimeRef = useRef(Date.now())
 
   // Track render performance
   useEffect(() => {
@@ -45,6 +46,23 @@ export default function SpectrumPlotUPlot({ spectrumData, metadata, perfMonitor 
     if (!maxHoldEnabled) {
       setMaxHoldData(null)
     }
+  }, [maxHoldEnabled])
+
+  // Reset max hold data when page becomes visible after being hidden
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        const hiddenDuration = Date.now() - lastVisibleTimeRef.current
+        if (hiddenDuration > 5000 && maxHoldEnabled) {
+          console.log(`Page was hidden for ${hiddenDuration}ms, resetting max hold`)
+          setMaxHoldData(null)
+        }
+      }
+      lastVisibleTimeRef.current = Date.now()
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
   }, [maxHoldEnabled])
 
   // Initialize uPlot chart when DOM ref is ready and we have initial data

@@ -30,23 +30,33 @@ echo "[2/3] Compiling ARM binary..."
 docker run --rm -v "$(pwd)":/build pluto-builder
 
 echo ""
-echo "[3/3] Checking binary..."
+echo "[3/3] Checking binaries..."
 if [ -f vita49_streamer ]; then
-    echo "✓ SUCCESS: Binary created!"
+    echo "✓ SUCCESS: Streamer binary created!"
     ls -lh vita49_streamer
     file vita49_streamer
-    echo ""
-    echo "=========================================="
-    echo "Next steps:"
-    echo "=========================================="
-    echo ""
-    echo "Deploy to Pluto:"
-    echo "  scp vita49_streamer root@pluto.local:/root/"
-    echo ""
-    echo "Or use automated deploy:"
-    echo "  make deploy-binary PLUTO_IP=pluto.local"
-    echo ""
 else
-    echo "✗ ERROR: Binary not found"
+    echo "✗ ERROR: vita49_streamer not found"
     exit 1
 fi
+
+if [ -f iio_buffer_diagnostic ]; then
+    echo "✓ SUCCESS: Diagnostic binary created!"
+    ls -lh iio_buffer_diagnostic
+else
+    echo "⚠ WARNING: iio_buffer_diagnostic not found"
+fi
+
+echo ""
+echo "=========================================="
+echo "Next steps:"
+echo "=========================================="
+echo ""
+echo "Deploy to Pluto:"
+echo "  ./scripts/deploy_to_pluto.sh           # Run streamer"
+echo "  ./scripts/deploy_to_pluto.sh --diag    # Run diagnostic"
+echo ""
+echo "Or use make:"
+echo "  make deploy-binary PLUTO_IP=pluto.local"
+echo "  make deploy-all PLUTO_IP=pluto.local"
+echo ""
