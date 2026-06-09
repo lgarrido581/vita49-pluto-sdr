@@ -139,6 +139,35 @@ class VRTClassID:
         )
 
 
+# Vendor-specific use of Class ID's 16-bit information_class_code as a
+# monotonic config_epoch tag. Wire format is unchanged when epoch == 0
+# (no Class ID emitted). Consumers can filter data packets by epoch to
+# discard samples taken under a stale configuration.
+EPOCH_CLASS_OUI = 0x00005A          # Same placeholder OUI used elsewhere
+EPOCH_PACKET_CLASS_CODE = 0xE000    # Marks the Class ID as carrying an epoch
+
+
+def make_epoch_class_id(config_epoch: int) -> 'VRTClassID':
+    """Build a VRTClassID whose information_class_code carries config_epoch.
+
+    config_epoch is masked to 16 bits; consumers handle wrap.
+    """
+    return VRTClassID(
+        oui=EPOCH_CLASS_OUI,
+        information_class_code=config_epoch & 0xFFFF,
+        packet_class_code=EPOCH_PACKET_CLASS_CODE,
+    )
+
+
+def class_id_epoch(class_id: Optional['VRTClassID']) -> int:
+    """Extract config_epoch from a Class ID, or 0 if absent/foreign."""
+    if class_id is None:
+        return 0
+    if class_id.packet_class_code != EPOCH_PACKET_CLASS_CODE:
+        return 0
+    return class_id.information_class_code & 0xFFFF
+
+
 @dataclass
 class VRTTimestamp:
     """
@@ -422,7 +451,8 @@ class VRTSignalDataPacket:
         timestamp: Optional[float] = None,
         packet_count: int = 0,
         include_trailer: bool = True,
-        scale_factor: int = 2**14
+        scale_factor: int = 2**14,
+        config_epoch: int = 0,
     ) -> 'VRTSignalDataPacket':
         """
         Create a VRT packet from complex IQ samples.
@@ -435,6 +465,10 @@ class VRTSignalDataPacket:
             packet_count: 4-bit packet counter (0-15)
             include_trailer: Whether to include trailer
             scale_factor: Scale factor for converting float to int16
+            config_epoch: Optional 16-bit monotonic config tag (0 = disabled,
+                preserves bit-identical wire format). When non-zero, attaches
+                a Class ID so consumers can associate IQ with a specific
+                context-packet generation.
 
         Returns:
             VRTSignalDataPacket ready for transmission
@@ -456,10 +490,12 @@ class VRTSignalDataPacket:
         # Create timestamp
         ts = VRTTimestamp.from_time(timestamp if timestamp else time.time())
 
+        class_id = make_epoch_class_id(config_epoch) if config_epoch else None
+
         # Create header
         header = VRTHeader(
             packet_type=PacketType.IF_DATA_WITH_STREAM_ID,
-            class_id_present=False,
+            class_id_present=class_id is not None,
             trailer_present=include_trailer,
             tsi=TSI.UTC,
             tsf=TSF.REAL_TIME_PS,
@@ -473,10 +509,16 @@ class VRTSignalDataPacket:
         return cls(
             header=header,
             stream_id=stream_id,
+            class_id=class_id,
             timestamp=ts,
             payload=payload,
             trailer=trailer
         )
+
+    @property
+    def config_epoch(self) -> int:
+        """Config epoch carried in the Class ID, or 0 if not tagged."""
+        return class_id_epoch(self.class_id)
 
     def to_iq_samples(self, scale_factor: int = 2**14) -> np.ndarray:
         """
@@ -581,6 +623,11 @@ class VRTContextPacket:
     reference_level_dbm: Optional[float] = None
     temperature_c: Optional[float] = None
 
+    # Optional 16-bit monotonic config tag. 0 = disabled (wire format
+    # unchanged). When non-zero, populates class_id so consumers can
+    # associate subsequent data packets with this context.
+    config_epoch: int = 0
+
     def __post_init__(self):
         """Update CIF based on which fields are set"""
         self.header.packet_type = PacketType.CONTEXT
@@ -591,6 +638,8 @@ class VRTContextPacket:
         self.cif.gain = self.gain_db is not None
         self.cif.reference_level = self.reference_level_dbm is not None
         self.cif.temperature = self.temperature_c is not None
+        if self.config_epoch and self.class_id is None:
+            self.class_id = make_epoch_class_id(self.config_epoch)
 
     def _encode_fixed_point_64(self, value: float, radix: int = 20) -> bytes:
         """Encode 64-bit fixed point value"""
@@ -785,7 +834,8 @@ class VRTContextPacket:
             sample_rate_hz=sample_rate_hz,
             gain_db=gain_db,
             reference_level_dbm=reference_level_dbm,
-            temperature_c=temperature_c
+            temperature_c=temperature_c,
+            config_epoch=class_id_epoch(class_id),
         )
 
 

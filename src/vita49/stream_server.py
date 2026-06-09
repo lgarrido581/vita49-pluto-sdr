@@ -117,12 +117,14 @@ class SDRConfig:
     """SDR hardware configuration"""
     uri: str = "ip:192.168.2.1"
     center_freq_hz: float = 2.4e9
+    tx_center_freq_hz: float = 2.4e9
     sample_rate_hz: float = 30e6
     bandwidth_hz: float = 20e6
     rx_gain_db: float = 20.0
     tx_gain_db: float = -10.0
     gain_mode: GainMode = GainMode.MANUAL
     rx_channels: List[int] = field(default_factory=lambda: [0])
+    tx_channels: List[int] = field(default_factory=list)
     buffer_size: int = 32768
 
 
@@ -286,11 +288,66 @@ class PlutoSDRInterface:
             'buffer_size': self.sdr.rx_buffer_size
         }
 
+    def configure_tx(self) -> bool:
+        """Configure TX side of the AD9361. RX must already be connected."""
+        if not self.connected or not self.sdr:
+            return False
+        try:
+            self.sdr.tx_enabled_channels = list(self.config.tx_channels)
+            self.sdr.tx_lo = int(self.config.tx_center_freq_hz)
+            self.sdr.tx_rf_bandwidth = int(self.config.bandwidth_hz)
+            for ch in self.config.tx_channels:
+                attr = f'tx_hardwaregain_chan{ch}'
+                if hasattr(self.sdr, attr):
+                    setattr(self.sdr, attr, self.config.tx_gain_db)
+            logger.info(
+                f"TX configured: channels={self.config.tx_channels} @ "
+                f"{self.config.tx_center_freq_hz/1e9:.3f} GHz, gain={self.config.tx_gain_db} dB"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to configure TX: {e}")
+            return False
+
+    def transmit(self, samples: np.ndarray, channel: int) -> bool:
+        """Push IQ samples to the AD9361 TX DAC for the given channel.
+
+        For a single enabled TX channel, pyadi-iio's sdr.tx() accepts a
+        single complex array. For multiple channels, it expects a list
+        with one array per enabled channel; this method places `samples`
+        in the correct slot and pads the others with zeros so a single
+        caller can drive one channel at a time.
+        """
+        if not self.connected or not self.sdr:
+            return False
+        if channel not in self.config.tx_channels:
+            logger.warning(f"TX channel {channel} not enabled")
+            return False
+        try:
+            with self._lock:
+                if len(self.config.tx_channels) == 1:
+                    self.sdr.tx(samples)
+                else:
+                    payload = []
+                    for ch in self.config.tx_channels:
+                        if ch == channel:
+                            payload.append(samples)
+                        else:
+                            payload.append(np.zeros_like(samples))
+                    self.sdr.tx(payload)
+            return True
+        except Exception as e:
+            logger.error(f"TX error on channel {channel}: {e}")
+            return False
+
 
 class SimulatedSDRInterface:
     """
     Simulated SDR interface for testing without hardware.
     Generates synthetic IQ data with configurable signals.
+
+    For TX: stores transmitted samples per-channel in a deque so tests
+    can assert exactly what would have been sent to the radio.
     """
 
     def __init__(self, config: SDRConfig):
@@ -298,6 +355,10 @@ class SimulatedSDRInterface:
         self.connected = False
         self._phase = 0.0
         self._sample_count = 0
+        # Per-channel TX capture: appends every numpy array passed to transmit()
+        self.tx_captured: Dict[int, deque] = {
+            ch: deque(maxlen=1024) for ch in config.tx_channels
+        }
 
     def connect(self) -> bool:
         self.connected = True
@@ -306,6 +367,17 @@ class SimulatedSDRInterface:
 
     def disconnect(self):
         self.connected = False
+
+    def transmit(self, samples: np.ndarray, channel: int) -> bool:
+        """Simulated TX: record the samples that would have hit the DAC."""
+        if not self.connected:
+            return False
+        if channel not in self.tx_captured:
+            # Channel not enabled — drop, mirroring a real radio's behavior
+            logger.warning(f"TX channel {channel} not enabled (enabled: {list(self.tx_captured)})")
+            return False
+        self.tx_captured[channel].append(np.asarray(samples, dtype=np.complex64))
+        return True
 
     def receive(self) -> Optional[List[np.ndarray]]:
         if not self.connected:
@@ -430,6 +502,11 @@ class VITA49StreamServer:
         self._stream_thread: Optional[threading.Thread] = None
         self._packet_counters: Dict[int, int] = {ch: 0 for ch in self.sdr_config.rx_channels}
 
+        # Monotonic config epoch tag. 0 = disabled (wire format unchanged).
+        # Bump via set_epoch() after any RX reconfig so consumers can filter
+        # out stale samples that were already in flight from the prior config.
+        self._current_epoch: int = 0
+
         # Callbacks
         self._on_packet_sent: Optional[Callable] = None
         self._on_error: Optional[Callable] = None
@@ -467,7 +544,8 @@ class VITA49StreamServer:
             bandwidth_hz=self.sdr_config.bandwidth_hz,
             rf_reference_frequency_hz=self.sdr_config.center_freq_hz,
             sample_rate_hz=self.sdr_config.sample_rate_hz,
-            gain_db=self.sdr_config.rx_gain_db
+            gain_db=self.sdr_config.rx_gain_db,
+            config_epoch=self._current_epoch,
         )
 
         try:
@@ -493,7 +571,8 @@ class VITA49StreamServer:
             stream_id=stream.stream_id,
             sample_rate=self.sdr_config.sample_rate_hz,
             timestamp=timestamp,
-            packet_count=self._packet_counters[channel]
+            packet_count=self._packet_counters[channel],
+            config_epoch=self._current_epoch,
         )
 
         try:
@@ -653,6 +732,19 @@ class VITA49StreamServer:
             self.streams[channel].port = port
             logger.info(f"Channel {channel} destination: {destination}:{port}")
 
+    def set_epoch(self, epoch: int) -> None:
+        """Bump the config_epoch tag stamped on outbound packets.
+
+        Call this after any reconfig that should invalidate samples
+        already in flight. Consumers filtering by min_epoch will then
+        drop the stale ones.
+        """
+        self._current_epoch = epoch & 0xFFFF
+
+    @property
+    def current_epoch(self) -> int:
+        return self._current_epoch
+
     def on_packet_sent(self, callback: Callable[[int, int], None]):
         """Set callback for packet sent events: callback(channel, bytes)"""
         self._on_packet_sent = callback
@@ -660,6 +752,117 @@ class VITA49StreamServer:
     def on_error(self, callback: Callable[[int, str], None]):
         """Set callback for error events: callback(channel, error_message)"""
         self._on_error = callback
+
+
+class VITA49TxServer:
+    """
+    VITA 49 TX server.
+
+    Listens on a UDP port for inbound VRT IF Data packets carrying IQ
+    samples to transmit. Each packet's stream_id selects the TX channel
+    via the convention:
+
+        stream_id = (0x02 << 24) | channel_index
+
+    Packets with stream_id high byte != 0x02 are dropped (they belong to
+    the RX side). The min_epoch filter optionally discards packets tagged
+    with a stale config_epoch.
+    """
+
+    TX_STREAM_ID_HIGH_BYTE = 0x02
+
+    def __init__(
+        self,
+        sdr,  # PlutoSDRInterface or SimulatedSDRInterface
+        listen_address: str = "0.0.0.0",
+        port: int = 4992,
+        buffer_size: int = 65536,
+    ):
+        self.sdr = sdr
+        self.listen_address = listen_address
+        self.port = port
+        self.buffer_size = buffer_size
+        self.socket: Optional[socket.socket] = None
+        self._running = False
+        self._receive_thread: Optional[threading.Thread] = None
+        self.min_epoch: int = 0
+        # Stats
+        self.packets_received = 0
+        self.packets_dropped_wrong_stream = 0
+        self.packets_dropped_stale_epoch = 0
+        self.packets_transmitted = 0
+        self.tx_failures = 0
+
+    def set_min_epoch(self, epoch: int) -> None:
+        """Discard inbound data packets tagged with epoch < this value."""
+        self.min_epoch = epoch & 0xFFFF
+
+    def start(self) -> bool:
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+            self.socket.bind((self.listen_address, self.port))
+            self.socket.settimeout(0.5)
+            self._running = True
+            self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+            self._receive_thread.start()
+            logger.info(f"VITA 49 TX server listening on {self.listen_address}:{self.port}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start TX server: {e}")
+            return False
+
+    def stop(self) -> None:
+        self._running = False
+        if self._receive_thread:
+            self._receive_thread.join(timeout=2.0)
+        if self.socket:
+            self.socket.close()
+            self.socket = None
+
+    def _handle_packet(self, data: bytes) -> None:
+        header = VRTHeader.decode(data[:4])
+        if header.packet_type not in (
+            PacketType.IF_DATA_WITH_STREAM_ID,
+            PacketType.IF_DATA_WITHOUT_STREAM_ID,
+        ):
+            return  # Context/command packets are handled elsewhere
+        packet = VRTSignalDataPacket.decode(data)
+        sid_high = (packet.stream_id >> 24) & 0xFF
+        if sid_high != self.TX_STREAM_ID_HIGH_BYTE:
+            self.packets_dropped_wrong_stream += 1
+            return
+        if self.min_epoch and packet.config_epoch and packet.config_epoch < self.min_epoch:
+            self.packets_dropped_stale_epoch += 1
+            return
+        channel = packet.stream_id & 0xFF
+        iq = packet.to_iq_samples()
+        self.packets_received += 1
+        if self.sdr.transmit(iq, channel):
+            self.packets_transmitted += 1
+        else:
+            self.tx_failures += 1
+
+    def _receive_loop(self) -> None:
+        while self._running:
+            try:
+                data, _ = self.socket.recvfrom(self.buffer_size)
+                self._handle_packet(data)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self._running:
+                    logger.error(f"TX server receive error: {e}")
+
+    def get_statistics(self) -> dict:
+        return {
+            'packets_received': self.packets_received,
+            'packets_transmitted': self.packets_transmitted,
+            'packets_dropped_wrong_stream': self.packets_dropped_wrong_stream,
+            'packets_dropped_stale_epoch': self.packets_dropped_stale_epoch,
+            'tx_failures': self.tx_failures,
+            'min_epoch': self.min_epoch,
+        }
 
 
 class VITA49StreamClient:
