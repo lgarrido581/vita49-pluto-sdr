@@ -118,7 +118,7 @@ typedef struct {
     int16_t *data;              /* Burst accumulation buffer (I/Q pairs) */
     atomic_size_t fill_count;   /* Current number of I/Q samples accumulated */
     atomic_bool ready;          /* Buffer full and ready to transmit */
-    uint64_t start_timestamp_us;/* Timestamp of first sample in burst */
+    uint64_t start_timestamp_ns;/* Timestamp of first sample in burst (nanoseconds) */
     uint32_t sequence_base;     /* Sequence number at burst start */
 } burst_buffer_t;
 
@@ -234,7 +234,7 @@ static uint64_t get_timestamp_us(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
 
 static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id, bool sample_loss);
-static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us, uint32_t stream_id, bool sample_loss);
+static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_ns, uint32_t stream_id, bool sample_loss);
 /* Multicore optimization thread functions */
 static void *dma_reader_thread(void *arg);     /* Core 0: DMA reader (producer) */
 static void *network_thread(void *arg);        /* Core 1: Network TX + Config (consumer) */
@@ -256,11 +256,20 @@ static inline uint64_t htonll(uint64_t x) {
     return ((uint64_t)htonl(x & 0xFFFFFFFF) << 32) | htonl(x >> 32);
 }
 
-/* Get current timestamp in microseconds */
+/* Get current timestamp in nanoseconds (GPS-disciplined via chrony+PPS on Pluto+).
+ * Uses clock_gettime(CLOCK_REALTIME) for nanosecond resolution rather than
+ * gettimeofday() which is limited to microseconds. On a GPS-locked Pluto+ the
+ * system clock tracks GPS to ~100-300 ns, which is embedded in the VITA49
+ * fractional timestamp field and used for TDOA cross-correlation. */
+static uint64_t get_timestamp_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* Legacy microsecond wrapper for subscriber timeout tracking (no precision needed) */
 static uint64_t get_timestamp_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+    return get_timestamp_ns() / 1000ULL;
 }
 
 /* Calculate optimal samples per packet to fit within MTU */
@@ -542,10 +551,11 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id,
     double gain = g_sdr_config.gain_db;
     pthread_mutex_unlock(&g_sdr_config.mutex);
 
-    /* Timestamp */
-    uint64_t ts_us = get_timestamp_us();
-    uint32_t ts_int = ts_us / 1000000;
-    uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;  /* Convert to picoseconds */
+    /* Timestamp - use nanosecond resolution for TDOA accuracy.
+     * VITA49 fractional field is in picoseconds; multiply ns remainder by 1000. */
+    uint64_t ts_ns = get_timestamp_ns();
+    uint32_t ts_int = (uint32_t)(ts_ns / 1000000000ULL);
+    uint64_t ts_frac = (ts_ns % 1000000000ULL) * 1000ULL;  /* ns → ps */
 
     /* Health status indicators */
     uint64_t underflows = sample_loss ? 1 : 0;  /* Indicate sample loss if detected */
@@ -647,7 +657,7 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id,
  */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count,
-                               uint64_t timestamp_us, uint32_t stream_id,
+                               uint64_t timestamp_ns, uint32_t stream_id,
                                bool sample_loss) {
     if (num_samples == 0) {
         *len = 0;
@@ -688,9 +698,10 @@ static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
     /* Calculate packet size */
     size_t total_words = 1 + 1 + 1 + 2 + (payload_bytes / 4) + 1;
 
-    /* Use pre-computed timestamp (passed from caller) */
-    uint32_t ts_int = timestamp_us / 1000000;
-    uint64_t ts_frac = (timestamp_us % 1000000) * 1000000ULL;
+    /* Use pre-computed timestamp (passed from caller, nanosecond resolution).
+     * VITA49 integer field = whole seconds, fractional field = picoseconds. */
+    uint32_t ts_int = (uint32_t)(timestamp_ns / 1000000000ULL);
+    uint64_t ts_frac = (timestamp_ns % 1000000000ULL) * 1000ULL;  /* ns → ps */
 
     /* Build header */
     uint32_t header = 0;
@@ -793,7 +804,7 @@ static int burst_buffer_init(burst_buffer_t *burst) {
     }
     atomic_store(&burst->fill_count, 0);
     atomic_store(&burst->ready, false);
-    burst->start_timestamp_us = 0;
+    burst->start_timestamp_ns = 0;
     burst->sequence_base = 0;
     return 0;
 }
@@ -814,7 +825,7 @@ static void burst_buffer_free(burst_buffer_t *burst) {
 static void burst_buffer_reset(burst_buffer_t *burst) {
     atomic_store(&burst->fill_count, 0);
     atomic_store(&burst->ready, false);
-    burst->start_timestamp_us = 0;
+    burst->start_timestamp_ns = 0;
 }
 
 /**
@@ -822,13 +833,13 @@ static void burst_buffer_reset(burst_buffer_t *burst) {
  * Returns true if buffer is now full and ready to transmit
  */
 static bool burst_buffer_add_samples(burst_buffer_t *burst, const int16_t *samples,
-                                     size_t sample_count, uint64_t timestamp_us,
+                                     size_t sample_count, uint64_t timestamp_ns,
                                      uint32_t sequence_num) {
     size_t current_fill = atomic_load(&burst->fill_count);
 
     /* Record start timestamp on first samples */
     if (current_fill == 0) {
-        burst->start_timestamp_us = timestamp_us;
+        burst->start_timestamp_ns = timestamp_ns;
         burst->sequence_base = sequence_num;
     }
 
@@ -1000,7 +1011,7 @@ static void *dma_reader_thread(void *arg) {
         update_burst_mode(current_rate);
         bool burst_mode = atomic_load(&g_burst_mode_enabled);
 
-        uint64_t timestamp_us = get_timestamp_us();
+        uint64_t timestamp_ns = get_timestamp_ns();
 
         if (mode == CHANNEL_MODE_DUAL) {
             /* Dual-channel mode: 8 bytes per sample (RX0_I, RX0_Q, RX1_I, RX1_Q interleaved) */
@@ -1010,7 +1021,7 @@ static void *dma_reader_thread(void *arg) {
             iq_buffer_entry_t buffer_rx0 = {
                 .data = g_ring_buffer_rx0.sample_pool[buffer_idx],
                 .sample_count = num_samples,
-                .timestamp_us = timestamp_us,
+                .timestamp_ns = timestamp_ns,
                 .sequence_num = atomic_fetch_add(&g_sequence_counter_rx0, 1),
                 .buffer_id = buffer_idx
             };
@@ -1018,7 +1029,7 @@ static void *dma_reader_thread(void *arg) {
             iq_buffer_entry_t buffer_rx1 = {
                 .data = g_ring_buffer_rx1.sample_pool[buffer_idx],
                 .sample_count = num_samples,
-                .timestamp_us = timestamp_us,
+                .timestamp_ns = timestamp_ns,
                 .sequence_num = atomic_fetch_add(&g_sequence_counter_rx1, 1),
                 .buffer_id = buffer_idx
             };
@@ -1039,9 +1050,9 @@ static void *dma_reader_thread(void *arg) {
             if (burst_mode) {
                 /* Burst mode: accumulate samples in burst buffers */
                 burst_buffer_add_samples(&g_burst_rx0, buffer_rx0.data, num_samples,
-                                        timestamp_us, buffer_rx0.sequence_num);
+                                        timestamp_ns, buffer_rx0.sequence_num);
                 burst_buffer_add_samples(&g_burst_rx1, buffer_rx1.data, num_samples,
-                                        timestamp_us, buffer_rx1.sequence_num);
+                                        timestamp_ns, buffer_rx1.sequence_num);
                 g_stats.dma_buffers_processed++;
             } else {
                 /* Streaming mode: push to ring buffers immediately */
@@ -1069,7 +1080,7 @@ static void *dma_reader_thread(void *arg) {
             iq_buffer_entry_t buffer_entry = {
                 .data = target_buffer->sample_pool[buffer_idx],
                 .sample_count = num_samples,
-                .timestamp_us = timestamp_us,
+                .timestamp_ns = timestamp_ns,
                 .sequence_num = atomic_fetch_add(seq_counter, 1),
                 .buffer_id = buffer_idx
             };
@@ -1083,7 +1094,7 @@ static void *dma_reader_thread(void *arg) {
                     (mode == CHANNEL_MODE_SINGLE_RX1) ? &g_burst_rx1 : &g_burst_rx0;
 
                 burst_buffer_add_samples(target_burst, buffer_entry.data, num_samples,
-                                        timestamp_us, buffer_entry.sequence_num);
+                                        timestamp_ns, buffer_entry.sequence_num);
                 g_stats.dma_buffers_processed++;
             } else {
                 /* Streaming mode: push to ring buffer (non-blocking) */
@@ -1130,7 +1141,7 @@ static void transmit_iq_buffer(iq_buffer_entry_t *iq_buffer, uint32_t stream_id,
                          iq_buffer->data + (offset * 2),
                          samples_this_packet,
                          packet_counter,
-                         iq_buffer->timestamp_us,
+                         iq_buffer->timestamp_ns,
                          stream_id,
                          *sample_loss_flag);
 
@@ -1340,7 +1351,7 @@ static void *network_thread(void *arg) {
                 iq_buffer_entry_t burst_entry = {
                     .data = g_burst_rx0.data,
                     .sample_count = sample_count,
-                    .timestamp_us = g_burst_rx0.start_timestamp_us,
+                    .timestamp_ns = g_burst_rx0.start_timestamp_ns,
                     .sequence_num = g_burst_rx0.sequence_base,
                     .buffer_id = 0
                 };
@@ -1366,7 +1377,7 @@ static void *network_thread(void *arg) {
                 iq_buffer_entry_t burst_entry = {
                     .data = g_burst_rx1.data,
                     .sample_count = sample_count,
-                    .timestamp_us = g_burst_rx1.start_timestamp_us,
+                    .timestamp_ns = g_burst_rx1.start_timestamp_ns,
                     .sequence_num = g_burst_rx1.sequence_base,
                     .buffer_id = 0
                 };
@@ -1448,7 +1459,7 @@ static void *network_thread(void *arg) {
                                          iq_rx0.data + (offset_rx0 * 2),
                                          samples_this_packet,
                                          &packet_count_rx0,
-                                         iq_rx0.timestamp_us,
+                                         iq_rx0.timestamp_ns,
                                          STREAM_ID_RX0,
                                          sample_loss_rx0);
 
@@ -1488,7 +1499,7 @@ static void *network_thread(void *arg) {
                                          iq_rx1.data + (offset_rx1 * 2),
                                          samples_this_packet,
                                          &packet_count_rx1,
-                                         iq_rx1.timestamp_us,
+                                         iq_rx1.timestamp_ns,
                                          STREAM_ID_RX1,
                                          sample_loss_rx1);
 
@@ -1582,7 +1593,7 @@ static void *network_thread(void *arg) {
                                      iq_buffer.data + (offset * 2),
                                      samples_this_packet,
                                      packet_counter,
-                                     iq_buffer.timestamp_us,
+                                     iq_buffer.timestamp_ns,
                                      stream_id,
                                      *sample_loss_flag);
 
