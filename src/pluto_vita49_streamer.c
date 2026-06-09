@@ -39,6 +39,7 @@
 #include <signal.h>
 #include <math.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <iio.h>
 #include "lock_free_ring_buffer.h"
 
@@ -46,8 +47,11 @@
 #define DEFAULT_FREQ_HZ         2400000000ULL   /* 2.4 GHz */
 #define DEFAULT_RATE_HZ         30000000        /* 30 MSPS */
 #define DEFAULT_GAIN_DB         20.0
+#define DEFAULT_TX_GAIN_DB      -10.0           /* AD9361 TX is attenuation: -89.75..0 dB */
+#define DEFAULT_TX_BUFFER_SIZE  4096            /* Samples per TX push (per channel) */
 #define CONTROL_PORT            4990            /* Config reception port */
-#define DATA_PORT               4991            /* Data streaming port */
+#define DATA_PORT               4991            /* RX data streaming port */
+#define TX_DATA_PORT            4992            /* TX data reception port (inbound IF Data) */
 #define CONTEXT_INTERVAL        100             /* Send context every N packets */
 #define MAX_SUBSCRIBERS         16              /* Max simultaneous receivers */
 
@@ -86,9 +90,17 @@
 #define VRT_TSI_UTC             0x1             /* UTC timestamp */
 #define VRT_TSF_PICOSECONDS     0x2             /* Picosecond fractional time */
 
-/* VITA49 Stream IDs - format: device_id(8) | data_type(8) | reserved(8) | channel(8) */
-#define STREAM_ID_RX0           0x01000001      /* Device 1, Channel 1 (RX0) */
-#define STREAM_ID_RX1           0x01000002      /* Device 1, Channel 2 (RX1) */
+/* Stream IDs. High byte 0x01 = RX, 0x02 = TX. Low byte = channel index. */
+#define RX_STREAM_ID_HIGH_BYTE  0x01
+#define TX_STREAM_ID_HIGH_BYTE  0x02
+#define RX0_STREAM_ID           0x01000000      /* RX channel 0 */
+#define RX1_STREAM_ID           0x01000001      /* RX channel 1 */
+#define TX0_STREAM_ID           0x02000000      /* TX channel 0 */
+#define TX1_STREAM_ID           0x02000001      /* TX channel 1 */
+
+/* config_epoch carried via VRT Class ID. Epoch 0 = untagged (wire format unchanged). */
+#define EPOCH_CLASS_OUI         0x00005A
+#define EPOCH_PACKET_CLASS_CODE 0xE000
 
 /* Global state */
 static volatile bool g_running = true;
@@ -118,13 +130,20 @@ typedef struct {
     int16_t *data;              /* Burst accumulation buffer (I/Q pairs) */
     atomic_size_t fill_count;   /* Current number of I/Q samples accumulated */
     atomic_bool ready;          /* Buffer full and ready to transmit */
-    uint64_t start_timestamp_us;/* Timestamp of first sample in burst */
+    uint64_t start_timestamp_ns;/* Timestamp of first sample in burst (nanoseconds) */
     uint32_t sequence_base;     /* Sequence number at burst start */
 } burst_buffer_t;
 
 static burst_buffer_t g_burst_rx0 = {0};
 static burst_buffer_t g_burst_rx1 = {0};
 static atomic_bool g_burst_mode_enabled = ATOMIC_VAR_INIT(false);
+
+/* Monotonic config epoch stamped on every outbound packet via Class ID.
+ * Updated ONLY by the streaming thread after buffer teardown/recreate so
+ * no pre-reconfig sample ever carries the new epoch tag.
+ * 0 = untagged (no Class ID emitted, wire format unchanged). */
+static volatile uint16_t g_current_epoch = 0;
+static uint16_t g_pending_epoch = 0;  /* Set by control thread, protected by g_sdr_config.mutex */
 
 /* Thread argument structure for network thread (Phase 3) */
 typedef struct {
@@ -165,6 +184,7 @@ typedef struct {
     uint32_t bandwidth_hz;
     double gain_db;
     channel_mode_t channel_mode;  /* Channel selection mode */
+    uint8_t enabled_rx_mask;      /* Bitmask: bit0=RX0, bit1=RX1 */
     bool config_changed;  /* Flag to signal streaming thread to reconfigure */
     pthread_mutex_t mutex;
 } sdr_config_t;
@@ -174,7 +194,8 @@ static sdr_config_t g_sdr_config = {
     .sample_rate_hz = DEFAULT_RATE_HZ,
     .bandwidth_hz = DEFAULT_RATE_HZ * 0.8,
     .gain_db = DEFAULT_GAIN_DB,
-    .channel_mode = CHANNEL_MODE_SINGLE_RX0,  /* Default: single channel RX0 for backward compatibility */
+    .channel_mode = CHANNEL_MODE_SINGLE_RX0,
+    .enabled_rx_mask = 0x01,
     .config_changed = false,
     .mutex = PTHREAD_MUTEX_INITIALIZER
 };
@@ -195,6 +216,39 @@ typedef struct {
 } stream_statistics_t;
 
 static stream_statistics_t g_stats = {0};
+
+/* TX Configuration */
+typedef struct {
+    uint64_t center_freq_hz;
+    double gain_db;
+    uint8_t enabled_tx_mask;  /* bit 0 = TX0, bit 1 = TX1 */
+    pthread_mutex_t mutex;
+} tx_config_t;
+
+static tx_config_t g_tx_config = {
+    .center_freq_hz = DEFAULT_FREQ_HZ,
+    .gain_db = DEFAULT_TX_GAIN_DB,
+    .enabled_tx_mask = 0x00,  /* TX disabled by default */
+    .mutex = PTHREAD_MUTEX_INITIALIZER
+};
+
+/* TX runtime statistics */
+typedef struct {
+    uint64_t packets_received;
+    uint64_t packets_transmitted;
+    uint64_t packets_dropped_wrong_stream;
+    uint64_t packets_dropped_disabled_ch;
+    uint64_t packets_dropped_decode;
+    uint64_t push_failures;
+    uint64_t bytes_pushed;
+    pthread_mutex_t mutex;
+} tx_stats_t;
+
+static tx_stats_t g_tx_stats = {0};
+
+/* TX replay mode: raw interleaved int16_t I,Q file, no header */
+static const char *g_tx_replay_path = NULL;
+static bool g_tx_replay_loop = false;
 
 /* VITA49 Packet Structures */
 #pragma pack(push, 1)
@@ -234,11 +288,14 @@ static uint64_t get_timestamp_us(void);
 static size_t calculate_optimal_samples_per_packet(size_t mtu);
 
 static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id, bool sample_loss);
-static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_us, uint32_t stream_id, bool sample_loss);
+static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data, size_t num_samples, uint8_t *packet_count, uint64_t timestamp_ns, uint32_t stream_id, bool sample_loss);
 /* Multicore optimization thread functions */
 static void *dma_reader_thread(void *arg);     /* Core 0: DMA reader (producer) */
 static void *network_thread(void *arg);        /* Core 1: Network TX + Config (consumer) */
+static void *tx_thread(void *arg);             /* TX UDP receive → DAC push */
+static void *tx_replay_thread(void *arg);      /* TX file replay → DAC push */
 static int configure_sdr(struct iio_context *ctx, struct iio_device *dev);
+static int configure_tx(struct iio_context *ctx, struct iio_device **tx_dev_out);
 
 /* Batch sending functions - sendmmsg() for 64x syscall reduction */
 static void batch_init(packet_batch_t *batch);
@@ -256,11 +313,20 @@ static inline uint64_t htonll(uint64_t x) {
     return ((uint64_t)htonl(x & 0xFFFFFFFF) << 32) | htonl(x >> 32);
 }
 
-/* Get current timestamp in microseconds */
+/* Get current timestamp in nanoseconds (GPS-disciplined via chrony+PPS on Pluto+).
+ * Uses clock_gettime(CLOCK_REALTIME) for nanosecond resolution rather than
+ * gettimeofday() which is limited to microseconds. On a GPS-locked Pluto+ the
+ * system clock tracks GPS to ~100-300 ns, which is embedded in the VITA49
+ * fractional timestamp field and used for TDOA cross-correlation. */
+static uint64_t get_timestamp_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* Legacy microsecond wrapper for subscriber timeout tracking (no precision needed) */
 static uint64_t get_timestamp_us(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+    return get_timestamp_ns() / 1000ULL;
 }
 
 /* Calculate optimal samples per packet to fit within MTU */
@@ -529,11 +595,12 @@ static int batch_flush_to_all_subscribers(int sock, packet_batch_t *batch) {
     return total_sent;
 }
 
-/* Encode VITA49 Context packet */
+/* Encode VITA49 Context packet.
+ * Uses offset-based layout to support optional Class ID for epoch tagging.
+ * VITA-49 field order: header, stream_id, [class_id], ts_int, ts_frac, cif, payload */
 static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id, bool sample_loss) {
-    vrt_context_header_t *hdr = (vrt_context_header_t *)buf;
-    uint8_t *payload = buf + sizeof(vrt_context_header_t);
-    size_t payload_len = 0;
+    uint16_t epoch = g_current_epoch;
+    bool emit_class_id = (epoch != 0);
 
     pthread_mutex_lock(&g_sdr_config.mutex);
     uint64_t freq = g_sdr_config.center_freq_hz;
@@ -542,184 +609,188 @@ static void encode_context_packet(uint8_t *buf, size_t *len, uint32_t stream_id,
     double gain = g_sdr_config.gain_db;
     pthread_mutex_unlock(&g_sdr_config.mutex);
 
-    /* Timestamp */
-    uint64_t ts_us = get_timestamp_us();
-    uint32_t ts_int = ts_us / 1000000;
-    uint64_t ts_frac = (ts_us % 1000000) * 1000000ULL;  /* Convert to picoseconds */
+    /* Timestamp - nanosecond resolution for TDOA accuracy (ns → ps for VITA49 frac field) */
+    uint64_t ts_ns = get_timestamp_ns();
+    uint32_t ts_int = (uint32_t)(ts_ns / 1000000000ULL);
+    uint64_t ts_frac = (ts_ns % 1000000000ULL) * 1000ULL;
 
-    /* Health status indicators */
-    uint64_t underflows = sample_loss ? 1 : 0;  /* Indicate sample loss if detected */
-    uint64_t overflows = 0;  /* Not currently tracked */
+    uint64_t underflows = sample_loss ? 1 : 0;
+    uint64_t overflows = 0;
 
-    /* Context Indicator Field (CIF) */
-    uint32_t cif = 0;
-    cif |= (1 << 29);  /* bandwidth */
-    cif |= (1 << 27);  /* rf_reference_frequency */
-    cif |= (1 << 23);  /* gain */
-    cif |= (1 << 21);  /* sample_rate */
-    cif |= (1 << 19);  /* state_event_indicators */
+    /* CIF: bandwidth, freq, gain, sample_rate, state_event */
+    uint32_t cif = (1 << 29) | (1 << 27) | (1 << 23) | (1 << 21) | (1 << 19);
 
-    /* Encode context fields in DESCENDING CIF bit order (VITA49 requirement)
-     * Bit 29: Bandwidth
-     * Bit 27: RF Reference Frequency
-     * Bit 23: Gain (comes BEFORE bit 21!)
-     * Bit 21: Sample Rate
-     * Bit 19: State/Event Indicators
-     *
-     * NOTE: Use memcpy to avoid alignment issues with uint64_t at non-8-byte offsets
-     */
-    int64_t bw_fixed = ((int64_t)bw * (1 << 20));
+    int64_t bw_fixed   = ((int64_t)bw   * (1 << 20));
     int64_t freq_fixed = ((int64_t)freq * (1 << 20));
     int64_t rate_fixed = ((int64_t)rate * (1 << 20));
     int16_t gain_fixed = (int16_t)(gain * 128);
 
-    /* Bit 29: Bandwidth (64-bit, 20-bit radix) */
-    uint64_t bw_be = htonll(bw_fixed);
-    memcpy(payload + payload_len, &bw_be, 8);
-    payload_len += 8;
+    /* Write fields sequentially */
+    size_t off = 0;
+    off += 4;  /* header slot — written last */
 
-    /* Bit 27: RF Reference Frequency (64-bit, 20-bit radix) */
-    uint64_t freq_be = htonll(freq_fixed);
-    memcpy(payload + payload_len, &freq_be, 8);
-    payload_len += 8;
+    uint32_t sid_be = htonl_custom(stream_id);
+    memcpy(buf + off, &sid_be, 4);
+    off += 4;
 
-    /* Bit 23: Gain - Stage 1 and Stage 2 (two 16-bit values, 7-bit radix) */
-    uint16_t gain_be = htons(gain_fixed);
-    memcpy(payload + payload_len, &gain_be, 2);
-    payload_len += 2;
-    uint16_t zero = 0;
-    memcpy(payload + payload_len, &zero, 2);  /* Stage 2 (unused) */
-    payload_len += 2;
-
-    /* Bit 21: Sample Rate (64-bit, 20-bit radix) */
-    uint64_t rate_be = htonll(rate_fixed);
-    memcpy(payload + payload_len, &rate_be, 8);
-    payload_len += 8;
-
-    /* Bit 19: State/Event Indicators (32-bit field)
-     * Bit 31: Calibrated Time (1 = time is calibrated)
-     * Bit 19: Overrange (1 = overflow detected)
-     * Bit 18: Sample Loss (1 = underflow/sample loss detected)
-     */
-    uint32_t state_event = 0;
-    state_event |= (1U << 31);  /* Calibrated Time */
-    if (overflows > 0) {
-        state_event |= (1 << 19);  /* Overrange indicator */
-    }
-    if (underflows > 0) {
-        state_event |= (1 << 18);  /* Sample Loss indicator */
-    }
-    uint32_t state_event_be = htonl_custom(state_event);
-    memcpy(payload + payload_len, &state_event_be, 4);
-    payload_len += 4;
-
-    /* DEBUG: Log what we're encoding */
-    static int debug_count = 0;
-    if (debug_count++ < 5) {  /* Only log first 5 packets */
-        printf("[DEBUG] Encoding context: freq=%.1f MHz, rate=%.1f MSPS, gain=%.1f dB\n",
-               freq / 1e6, rate / 1e6, gain);
-        printf("[DEBUG] Fixed-point: freq=%lld, rate=%lld, gain=%d\n",
-               (long long)freq_fixed, (long long)rate_fixed, gain_fixed);
-        printf("[DEBUG] Payload length: %zu bytes\n", payload_len);
+    if (emit_class_id) {
+        uint32_t w1 = (EPOCH_CLASS_OUI & 0xFFFFFF) << 8;
+        uint32_t w2 = ((uint32_t)epoch << 16) | (EPOCH_PACKET_CLASS_CODE & 0xFFFF);
+        uint32_t w1_be = htonl_custom(w1);
+        uint32_t w2_be = htonl_custom(w2);
+        memcpy(buf + off,     &w1_be, 4);
+        memcpy(buf + off + 4, &w2_be, 4);
+        off += 8;
     }
 
-    /* Calculate packet size in 32-bit words */
-    size_t total_words = 1 + 1 + 1 + 2 + 1 + (payload_len / 4);
+    uint32_t ts_int_be  = htonl_custom(ts_int);
+    uint64_t ts_frac_be = htonll(ts_frac);
+    memcpy(buf + off, &ts_int_be,  4); off += 4;
+    memcpy(buf + off, &ts_frac_be, 8); off += 8;
 
-    /* Build header */
+    uint32_t cif_be = htonl_custom(cif);
+    memcpy(buf + off, &cif_be, 4);
+    off += 4;
+
+    /* CIF payload in descending bit order */
+    uint64_t bw_be   = htonll(bw_fixed);   memcpy(buf + off, &bw_be,   8); off += 8;
+    uint64_t freq_be = htonll(freq_fixed); memcpy(buf + off, &freq_be, 8); off += 8;
+    uint16_t gain_be = htons(gain_fixed);  memcpy(buf + off, &gain_be, 2); off += 2;
+    uint16_t zero = 0;                     memcpy(buf + off, &zero,    2); off += 2;
+    uint64_t rate_be = htonll(rate_fixed); memcpy(buf + off, &rate_be, 8); off += 8;
+
+    uint32_t state_event = (1U << 31);  /* Calibrated Time */
+    if (overflows  > 0) state_event |= (1 << 19);
+    if (underflows > 0) state_event |= (1 << 18);
+    uint32_t se_be = htonl_custom(state_event);
+    memcpy(buf + off, &se_be, 4);
+    off += 4;
+
+    size_t total_words = off / 4;
     uint32_t header = 0;
     header |= (VRT_PKT_TYPE_CONTEXT & 0xF) << 28;
+    if (emit_class_id) header |= (1 << 27);
     header |= (VRT_TSI_UTC & 0x3) << 22;
     header |= (VRT_TSF_PICOSECONDS & 0x3) << 20;
     header |= (total_words & 0xFFFF);
+    uint32_t header_be = htonl_custom(header);
+    memcpy(buf, &header_be, 4);
 
-    hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(stream_id);
-    hdr->timestamp_int = htonl_custom(ts_int);
-    hdr->timestamp_frac = htonll(ts_frac);
-    hdr->cif = htonl_custom(cif);
-
-    *len = sizeof(vrt_context_header_t) + payload_len;
+    *len = off;
 }
 
-/* Encode VITA49 Data packet with big-endian byte order (VITA49 standard)
- * Samples are byte-swapped to big-endian for protocol compliance.
- */
+/* Encode VITA49 Data packet.
+ * Uses offset-based layout to support optional Class ID for epoch tagging.
+ * timestamp_ns: DMA-thread capture time (GPS-disciplined, ns resolution).
+ * VITA-49 field order: header, stream_id, [class_id], ts_int, ts_frac, payload, trailer */
 static void encode_data_packet(uint8_t *buf, size_t *len, int16_t *iq_data,
                                size_t num_samples, uint8_t *packet_count,
-                               uint64_t timestamp_us, uint32_t stream_id,
+                               uint64_t timestamp_ns, uint32_t stream_id,
                                bool sample_loss) {
     if (num_samples == 0) {
         *len = 0;
         return;
     }
 
-    vrt_data_header_t *hdr = (vrt_data_header_t *)buf;
-    uint8_t *payload = buf + sizeof(vrt_data_header_t);
+    uint16_t epoch = g_current_epoch;
+    bool emit_class_id = (epoch != 0);
 
-    /* Byte-swap samples to big-endian (VITA49 requirement)
-     * Each complex sample = 2 int16 values (I + Q)
-     */
-    size_t num_int16_values = num_samples * 2;  /* I and Q for each sample */
-    int16_t *src = iq_data;
-    int16_t *dst = (int16_t *)payload;
+    size_t off = 0;
+    off += 4;  /* header slot — written last */
 
-    for (size_t i = 0; i < num_int16_values; i++) {
-        dst[i] = (int16_t)htons((uint16_t)src[i]);
+    /* stream_id */
+    uint32_t sid_be = htonl_custom(stream_id);
+    memcpy(buf + off, &sid_be, 4);
+    off += 4;
+
+    /* Optional Class ID (epoch tag) */
+    if (emit_class_id) {
+        uint32_t w1 = (EPOCH_CLASS_OUI & 0xFFFFFF) << 8;
+        uint32_t w2 = ((uint32_t)epoch << 16) | (EPOCH_PACKET_CLASS_CODE & 0xFFFF);
+        uint32_t w1_be = htonl_custom(w1);
+        uint32_t w2_be = htonl_custom(w2);
+        memcpy(buf + off,     &w1_be, 4);
+        memcpy(buf + off + 4, &w2_be, 4);
+        off += 8;
     }
 
-    size_t payload_bytes = num_int16_values * sizeof(int16_t);
+    /* Timestamps — nanosecond resolution, VITA49 frac field in picoseconds */
+    uint32_t ts_int  = (uint32_t)(timestamp_ns / 1000000000ULL);
+    uint64_t ts_frac = (timestamp_ns % 1000000000ULL) * 1000ULL;  /* ns → ps */
+    uint32_t ts_int_be  = htonl_custom(ts_int);
+    uint64_t ts_frac_be = htonll(ts_frac);
+    memcpy(buf + off, &ts_int_be,  4); off += 4;
+    memcpy(buf + off, &ts_frac_be, 8); off += 8;
 
-    /* Pad to 32-bit boundary if needed */
+    /* Payload: byte-swap I/Q samples to big-endian */
+    int16_t *payload = (int16_t *)(buf + off);
+    size_t num_int16 = num_samples * 2;
+    for (size_t i = 0; i < num_int16; i++) {
+        payload[i] = (int16_t)htons((uint16_t)iq_data[i]);
+    }
+    size_t payload_bytes = num_int16 * sizeof(int16_t);
+
+    /* Pad to 32-bit boundary */
     size_t padding = (4 - (payload_bytes % 4)) % 4;
     if (padding) {
-        memset(payload + payload_bytes, 0, padding);
+        memset((uint8_t *)payload + payload_bytes, 0, padding);
         payload_bytes += padding;
     }
+    off += payload_bytes;
 
     /* Trailer */
-    uint32_t *trailer = (uint32_t *)(payload + payload_bytes);
     uint32_t trailer_val = 0x40000000;  /* valid_data = 1 (bit 30) */
-    if (sample_loss) {
-        trailer_val |= (1 << 24);  /* sample_loss = 1 (bit 24) */
-    }
-    *trailer = htonl_custom(trailer_val);
+    if (sample_loss) trailer_val |= (1 << 24);
+    uint32_t trailer_be = htonl_custom(trailer_val);
+    memcpy(buf + off, &trailer_be, 4);
+    off += 4;
 
-    /* Calculate packet size */
-    size_t total_words = 1 + 1 + 1 + 2 + (payload_bytes / 4) + 1;
-
-    /* Use pre-computed timestamp (passed from caller) */
-    uint32_t ts_int = timestamp_us / 1000000;
-    uint64_t ts_frac = (timestamp_us % 1000000) * 1000000ULL;
-
-    /* Build header */
+    /* Build header last */
+    size_t total_words = off / 4;
     uint32_t header = 0;
     header |= (VRT_PKT_TYPE_DATA & 0xF) << 28;
-    header |= (1 << 26);  /* Trailer present */
+    if (emit_class_id) header |= (1 << 27);
+    header |= (1 << 26);  /* trailer_present */
     header |= (VRT_TSI_UTC & 0x3) << 22;
     header |= (VRT_TSF_PICOSECONDS & 0x3) << 20;
     header |= ((*packet_count) & 0xF) << 16;
     header |= (total_words & 0xFFFF);
+    uint32_t header_be = htonl_custom(header);
+    memcpy(buf, &header_be, 4);
 
-    hdr->header = htonl_custom(header);
-    hdr->stream_id = htonl_custom(stream_id);
-    hdr->timestamp_int = htonl_custom(ts_int);
-    hdr->timestamp_frac = htonll(ts_frac);
-
-    *len = sizeof(vrt_data_header_t) + payload_bytes + sizeof(uint32_t);
+    *len = off;
     *packet_count = (*packet_count + 1) & 0xF;
 }
 
-/* Parse VITA49 Context packet and extract configuration */
+/* Parse VITA49 Context packet and extract configuration.
+ * Also extracts config_epoch from Class ID if present (*epoch_out left
+ * untouched when no epoch is carried). */
 static int parse_context_packet(const uint8_t *buf, size_t len,
                                 uint64_t *freq_hz, uint32_t *rate_hz, double *gain_db,
-                                channel_mode_t *channel_mode) {
+                                channel_mode_t *channel_mode, uint16_t *epoch_out) {
     if (len < 28) return -1;  /* Minimum context packet size */
 
-    /* Skip VRT header (4 bytes) and stream ID (4 bytes) */
-    const uint8_t *p = buf + 8;
+    uint32_t hdr_word = ntohl(*(const uint32_t *)buf);
+    bool class_id_present = (hdr_word >> 27) & 0x1;
+    const uint8_t *p = buf + 4;
+
+    /* stream_id */
+    p += 4;
+
+    /* Optional Class ID — extract epoch if present */
+    if (class_id_present) {
+        if ((size_t)(p - buf) + 8 > len) return -1;
+        uint32_t w2 = ntohl(*(const uint32_t *)(p + 4));
+        uint16_t info_class = (uint16_t)((w2 >> 16) & 0xFFFF);
+        uint16_t pkt_class  = (uint16_t)(w2 & 0xFFFF);
+        if (pkt_class == EPOCH_PACKET_CLASS_CODE && epoch_out != NULL) {
+            *epoch_out = info_class;
+        }
+        p += 8;
+    }
 
     /* Skip timestamps (12 bytes) */
+    if ((size_t)(p - buf) + 12 > len) return -1;
     p += 12;
 
     /* Read Context Indicator Field (CIF) */
@@ -793,7 +864,7 @@ static int burst_buffer_init(burst_buffer_t *burst) {
     }
     atomic_store(&burst->fill_count, 0);
     atomic_store(&burst->ready, false);
-    burst->start_timestamp_us = 0;
+    burst->start_timestamp_ns = 0;
     burst->sequence_base = 0;
     return 0;
 }
@@ -814,7 +885,7 @@ static void burst_buffer_free(burst_buffer_t *burst) {
 static void burst_buffer_reset(burst_buffer_t *burst) {
     atomic_store(&burst->fill_count, 0);
     atomic_store(&burst->ready, false);
-    burst->start_timestamp_us = 0;
+    burst->start_timestamp_ns = 0;
 }
 
 /**
@@ -822,13 +893,13 @@ static void burst_buffer_reset(burst_buffer_t *burst) {
  * Returns true if buffer is now full and ready to transmit
  */
 static bool burst_buffer_add_samples(burst_buffer_t *burst, const int16_t *samples,
-                                     size_t sample_count, uint64_t timestamp_us,
+                                     size_t sample_count, uint64_t timestamp_ns,
                                      uint32_t sequence_num) {
     size_t current_fill = atomic_load(&burst->fill_count);
 
     /* Record start timestamp on first samples */
     if (current_fill == 0) {
-        burst->start_timestamp_us = timestamp_us;
+        burst->start_timestamp_ns = timestamp_ns;
         burst->sequence_base = sequence_num;
     }
 
@@ -963,6 +1034,13 @@ static void *dma_reader_thread(void *arg) {
             pthread_mutex_lock(&g_sdr_config.mutex);
             rate = g_sdr_config.sample_rate_hz;
             g_sdr_config.config_changed = false;
+            /* Promote pending epoch now that old buffer is destroyed and new
+             * config is applied — no pre-reconfig sample can carry this tag */
+            if (g_pending_epoch != 0) {
+                g_current_epoch = g_pending_epoch;
+                g_pending_epoch = 0;
+                printf("[DMA Reader] Epoch promoted to %u\n", g_current_epoch);
+            }
             pthread_mutex_unlock(&g_sdr_config.mutex);
 
             buffer_samples = CLAMP((rate * BUFFER_TIME_MS) / 1000,
@@ -1000,7 +1078,7 @@ static void *dma_reader_thread(void *arg) {
         update_burst_mode(current_rate);
         bool burst_mode = atomic_load(&g_burst_mode_enabled);
 
-        uint64_t timestamp_us = get_timestamp_us();
+        uint64_t timestamp_ns = get_timestamp_ns();
 
         if (mode == CHANNEL_MODE_DUAL) {
             /* Dual-channel mode: 8 bytes per sample (RX0_I, RX0_Q, RX1_I, RX1_Q interleaved) */
@@ -1010,7 +1088,7 @@ static void *dma_reader_thread(void *arg) {
             iq_buffer_entry_t buffer_rx0 = {
                 .data = g_ring_buffer_rx0.sample_pool[buffer_idx],
                 .sample_count = num_samples,
-                .timestamp_us = timestamp_us,
+                .timestamp_ns = timestamp_ns,
                 .sequence_num = atomic_fetch_add(&g_sequence_counter_rx0, 1),
                 .buffer_id = buffer_idx
             };
@@ -1018,7 +1096,7 @@ static void *dma_reader_thread(void *arg) {
             iq_buffer_entry_t buffer_rx1 = {
                 .data = g_ring_buffer_rx1.sample_pool[buffer_idx],
                 .sample_count = num_samples,
-                .timestamp_us = timestamp_us,
+                .timestamp_ns = timestamp_ns,
                 .sequence_num = atomic_fetch_add(&g_sequence_counter_rx1, 1),
                 .buffer_id = buffer_idx
             };
@@ -1039,9 +1117,9 @@ static void *dma_reader_thread(void *arg) {
             if (burst_mode) {
                 /* Burst mode: accumulate samples in burst buffers */
                 burst_buffer_add_samples(&g_burst_rx0, buffer_rx0.data, num_samples,
-                                        timestamp_us, buffer_rx0.sequence_num);
+                                        timestamp_ns, buffer_rx0.sequence_num);
                 burst_buffer_add_samples(&g_burst_rx1, buffer_rx1.data, num_samples,
-                                        timestamp_us, buffer_rx1.sequence_num);
+                                        timestamp_ns, buffer_rx1.sequence_num);
                 g_stats.dma_buffers_processed++;
             } else {
                 /* Streaming mode: push to ring buffers immediately */
@@ -1069,7 +1147,7 @@ static void *dma_reader_thread(void *arg) {
             iq_buffer_entry_t buffer_entry = {
                 .data = target_buffer->sample_pool[buffer_idx],
                 .sample_count = num_samples,
-                .timestamp_us = timestamp_us,
+                .timestamp_ns = timestamp_ns,
                 .sequence_num = atomic_fetch_add(seq_counter, 1),
                 .buffer_id = buffer_idx
             };
@@ -1083,7 +1161,7 @@ static void *dma_reader_thread(void *arg) {
                     (mode == CHANNEL_MODE_SINGLE_RX1) ? &g_burst_rx1 : &g_burst_rx0;
 
                 burst_buffer_add_samples(target_burst, buffer_entry.data, num_samples,
-                                        timestamp_us, buffer_entry.sequence_num);
+                                        timestamp_ns, buffer_entry.sequence_num);
                 g_stats.dma_buffers_processed++;
             } else {
                 /* Streaming mode: push to ring buffer (non-blocking) */
@@ -1130,7 +1208,7 @@ static void transmit_iq_buffer(iq_buffer_entry_t *iq_buffer, uint32_t stream_id,
                          iq_buffer->data + (offset * 2),
                          samples_this_packet,
                          packet_counter,
-                         iq_buffer->timestamp_us,
+                         iq_buffer->timestamp_ns,
                          stream_id,
                          *sample_loss_flag);
 
@@ -1258,8 +1336,9 @@ static void *network_thread(void *arg) {
             uint32_t new_rate = g_sdr_config.sample_rate_hz;
             double new_gain = g_sdr_config.gain_db;
             channel_mode_t new_channel_mode = g_sdr_config.channel_mode;
+            uint16_t client_epoch = 0;
 
-            if (parse_context_packet(config_buf, config_recv, &new_freq, &new_rate, &new_gain, &new_channel_mode) == 0) {
+            if (parse_context_packet(config_buf, config_recv, &new_freq, &new_rate, &new_gain, &new_channel_mode, &client_epoch) == 0) {
                 bool changed = false;
 
                 pthread_mutex_lock(&g_sdr_config.mutex);
@@ -1296,15 +1375,20 @@ static void *network_thread(void *arg) {
 
                 if (changed) {
                     g_sdr_config.config_changed = true;
+                    /* Stage the client's epoch so the streaming thread can
+                     * apply it after buffer teardown/recreate */
+                    if (client_epoch != 0) {
+                        g_pending_epoch = client_epoch;
+                    }
                 }
-                
+
                 pthread_mutex_unlock(&g_sdr_config.mutex);
                 
                 /* Add client as subscriber */
                 add_subscriber(&client_addr);
                 
                 /* Send immediate context packet response */
-                encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0, false);
+                encode_context_packet(context_buf, &context_packet_len, RX0_STREAM_ID, false);
                 sendto(data_sock, context_buf, context_packet_len, 0,
                       (struct sockaddr *)&client_addr, sizeof(client_addr));
                 g_stats.contexts_sent++;
@@ -1340,13 +1424,13 @@ static void *network_thread(void *arg) {
                 iq_buffer_entry_t burst_entry = {
                     .data = g_burst_rx0.data,
                     .sample_count = sample_count,
-                    .timestamp_us = g_burst_rx0.start_timestamp_us,
+                    .timestamp_ns = g_burst_rx0.start_timestamp_ns,
                     .sequence_num = g_burst_rx0.sequence_base,
                     .buffer_id = 0
                 };
 
                 /* Transmit using existing packet encoding (stream ID RX0) */
-                transmit_iq_buffer(&burst_entry, STREAM_ID_RX0, &packet_count_rx0,
+                transmit_iq_buffer(&burst_entry, RX0_STREAM_ID, &packet_count_rx0,
                                   &packets_since_context_rx0, &sample_loss_rx0,
                                   data_sock, batch, context_buf, &context_packet_len);
 
@@ -1366,12 +1450,12 @@ static void *network_thread(void *arg) {
                 iq_buffer_entry_t burst_entry = {
                     .data = g_burst_rx1.data,
                     .sample_count = sample_count,
-                    .timestamp_us = g_burst_rx1.start_timestamp_us,
+                    .timestamp_ns = g_burst_rx1.start_timestamp_ns,
                     .sequence_num = g_burst_rx1.sequence_base,
                     .buffer_id = 0
                 };
 
-                transmit_iq_buffer(&burst_entry, STREAM_ID_RX1, &packet_count_rx1,
+                transmit_iq_buffer(&burst_entry, RX1_STREAM_ID, &packet_count_rx1,
                                   &packets_since_context_rx1, &sample_loss_rx1,
                                   data_sock, batch, context_buf, &context_packet_len);
 
@@ -1448,8 +1532,8 @@ static void *network_thread(void *arg) {
                                          iq_rx0.data + (offset_rx0 * 2),
                                          samples_this_packet,
                                          &packet_count_rx0,
-                                         iq_rx0.timestamp_us,
-                                         STREAM_ID_RX0,
+                                         iq_rx0.timestamp_ns,
+                                         RX0_STREAM_ID,
                                          sample_loss_rx0);
 
                         batch_commit_packet(batch, packet_len);
@@ -1464,7 +1548,7 @@ static void *network_thread(void *arg) {
                                 batch_flush_to_all_subscribers(data_sock, batch);
                                 batch_init(batch);
                             }
-                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX0, sample_loss_rx0);
+                            encode_context_packet(context_buf, &context_packet_len, RX0_STREAM_ID, sample_loss_rx0);
                             broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
                             g_stats.contexts_sent++;
                             packets_since_context_rx0 = 0;
@@ -1488,8 +1572,8 @@ static void *network_thread(void *arg) {
                                          iq_rx1.data + (offset_rx1 * 2),
                                          samples_this_packet,
                                          &packet_count_rx1,
-                                         iq_rx1.timestamp_us,
-                                         STREAM_ID_RX1,
+                                         iq_rx1.timestamp_ns,
+                                         RX1_STREAM_ID,
                                          sample_loss_rx1);
 
                         batch_commit_packet(batch, packet_len);
@@ -1504,7 +1588,7 @@ static void *network_thread(void *arg) {
                                 batch_flush_to_all_subscribers(data_sock, batch);
                                 batch_init(batch);
                             }
-                            encode_context_packet(context_buf, &context_packet_len, STREAM_ID_RX1, sample_loss_rx1);
+                            encode_context_packet(context_buf, &context_packet_len, RX1_STREAM_ID, sample_loss_rx1);
                             broadcast_to_subscribers(data_sock, context_buf, context_packet_len);
                             g_stats.contexts_sent++;
                             packets_since_context_rx1 = 0;
@@ -1545,7 +1629,7 @@ static void *network_thread(void *arg) {
             int *context_counter =
                 (mode == CHANNEL_MODE_SINGLE_RX1) ? &packets_since_context_rx1 : &packets_since_context_rx0;
             uint32_t stream_id =
-                (mode == CHANNEL_MODE_SINGLE_RX1) ? STREAM_ID_RX1 : STREAM_ID_RX0;
+                (mode == CHANNEL_MODE_SINGLE_RX1) ? RX1_STREAM_ID : RX0_STREAM_ID;
             uint32_t *last_sequence =
                 (mode == CHANNEL_MODE_SINGLE_RX1) ? &last_sequence_rx1 : &last_sequence_rx0;
             bool *sample_loss_flag =
@@ -1582,7 +1666,7 @@ static void *network_thread(void *arg) {
                                      iq_buffer.data + (offset * 2),
                                      samples_this_packet,
                                      packet_counter,
-                                     iq_buffer.timestamp_us,
+                                     iq_buffer.timestamp_ns,
                                      stream_id,
                                      *sample_loss_flag);
 
@@ -1748,6 +1832,198 @@ static int configure_sdr(struct iio_context *ctx, struct iio_device *dev) {
     return 0;
 }
 
+/* Configure TX side of the AD9361.  Returns 0 on success, -1 on failure.
+ * *tx_dev_out receives the iio_device pointer for the TX DAC. */
+static int configure_tx(struct iio_context *ctx, struct iio_device **tx_dev_out) {
+    if (!ctx || !tx_dev_out) return -1;
+
+    struct iio_device *tx_dev = iio_context_find_device(ctx, "cf-ad9361-dds-core-lpc");
+    if (!tx_dev) {
+        fprintf(stderr, "[TX] ERROR: cf-ad9361-dds-core-lpc not found\n");
+        return -1;
+    }
+    *tx_dev_out = tx_dev;
+
+    pthread_mutex_lock(&g_tx_config.mutex);
+    uint64_t tx_freq = g_tx_config.center_freq_hz;
+    double   tx_gain = g_tx_config.gain_db;
+    pthread_mutex_unlock(&g_tx_config.mutex);
+
+    /* Set TX LO via ad9361-phy */
+    struct iio_device *phy = iio_context_find_device(ctx, "ad9361-phy");
+    if (phy) {
+        struct iio_channel *tx_lo = iio_device_find_channel(phy, "altvoltage1", true);
+        if (tx_lo) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%llu", (unsigned long long)tx_freq);
+            iio_channel_attr_write(tx_lo, "frequency", buf);
+        }
+        /* TX attenuation (0 to -89.75 dB in 0.25 dB steps, stored as mdB magnitude) */
+        struct iio_channel *tx_ch = iio_device_find_channel(phy, "voltage0", true);
+        if (tx_ch) {
+            char buf[32];
+            int atten_mdb = (int)(-tx_gain * 1000.0);
+            if (atten_mdb < 0) atten_mdb = 0;
+            snprintf(buf, sizeof(buf), "%d", atten_mdb);
+            iio_channel_attr_write(tx_ch, "hardwaregain", buf);
+        }
+    }
+
+    printf("[TX] Configured: %.3f MHz, gain=%.1f dB\n",
+           tx_freq / 1e6, tx_gain);
+    return 0;
+}
+
+/* TX UDP receive thread: listens on TX_DATA_PORT for inbound VRT IF Data
+ * packets and pushes I/Q samples to the AD9361 DAC. */
+static void *tx_thread(void *arg) {
+    struct iio_device *tx_dev = (struct iio_device *)arg;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("[TX Thread] socket");
+        return NULL;
+    }
+
+    int rcvbuf = 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(TX_DATA_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[TX Thread] bind");
+        close(sock);
+        return NULL;
+    }
+
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    printf("[TX Thread] Listening on port %d\n", TX_DATA_PORT);
+
+    uint8_t buf[MAX_PACKET_BUFFER];
+
+    while (g_running) {
+        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) continue;
+
+        /* Minimal VRT header parse: need stream_id high byte */
+        if (n < 8) continue;
+        uint32_t hdr  = ntohl(*(uint32_t *)buf);
+        uint32_t sid  = ntohl(*(uint32_t *)(buf + 4));
+        uint8_t  sid_high = (sid >> 24) & 0xFF;
+
+        pthread_mutex_lock(&g_tx_stats.mutex);
+        g_tx_stats.packets_received++;
+        pthread_mutex_unlock(&g_tx_stats.mutex);
+
+        if (sid_high != TX_STREAM_ID_HIGH_BYTE) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_wrong_stream++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        uint8_t channel = sid & 0xFF;
+        uint8_t tx_mask;
+        pthread_mutex_lock(&g_tx_config.mutex);
+        tx_mask = g_tx_config.enabled_tx_mask;
+        pthread_mutex_unlock(&g_tx_config.mutex);
+
+        if (!(tx_mask & (1 << channel))) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_dropped_disabled_ch++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+            continue;
+        }
+
+        /* Locate payload: skip header(4) + stream_id(4) + [class_id(8)] + ts(12) */
+        bool class_id_present = (hdr >> 27) & 0x1;
+        size_t payload_off = 4 + 4 + (class_id_present ? 8 : 0) + 12;
+        bool trailer_present = (hdr >> 26) & 0x1;
+        uint32_t total_words = hdr & 0xFFFF;
+        size_t total_bytes = total_words * 4;
+        size_t payload_bytes = total_bytes - payload_off - (trailer_present ? 4 : 0);
+
+        if (payload_off + payload_bytes > (size_t)n) continue;
+
+        int16_t *samples = (int16_t *)(buf + payload_off);
+        size_t num_int16 = payload_bytes / sizeof(int16_t);
+
+        /* Byte-swap from big-endian wire format to native */
+        for (size_t i = 0; i < num_int16; i++) {
+            samples[i] = (int16_t)ntohs((uint16_t)samples[i]);
+        }
+
+        /* Push to DAC via iio_buffer */
+        struct iio_channel *tx_ch = iio_device_find_channel(tx_dev,
+            channel == 0 ? "voltage0" : "voltage1", true);
+        if (!tx_ch) continue;
+
+        /* Write samples directly to the TX channel */
+        ssize_t pushed = iio_channel_write(tx_ch, samples, payload_bytes);
+        if (pushed < 0) {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.push_failures++;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+        } else {
+            pthread_mutex_lock(&g_tx_stats.mutex);
+            g_tx_stats.packets_transmitted++;
+            g_tx_stats.bytes_pushed += (uint64_t)pushed;
+            pthread_mutex_unlock(&g_tx_stats.mutex);
+        }
+    }
+
+    close(sock);
+    return NULL;
+}
+
+/* TX file-replay thread: reads a raw int16 I/Q file and pushes to the DAC.
+ * File format: interleaved int16_t I,Q in little-endian (native ARM) order. */
+static void *tx_replay_thread(void *arg) {
+    struct iio_device *tx_dev = (struct iio_device *)arg;
+    const char *path = g_tx_replay_path;
+    bool loop = g_tx_replay_loop;
+
+    printf("[TX Replay] Starting playback: %s%s\n", path, loop ? " (loop)" : "");
+
+    do {
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            fprintf(stderr, "[TX Replay] Cannot open %s: %s\n", path, strerror(errno));
+            break;
+        }
+
+        int16_t buf[DEFAULT_TX_BUFFER_SIZE * 2];  /* I+Q pairs */
+        struct iio_channel *tx_ch = iio_device_find_channel(tx_dev, "voltage0", true);
+
+        while (g_running) {
+            size_t n = fread(buf, sizeof(int16_t), DEFAULT_TX_BUFFER_SIZE * 2, f);
+            if (n == 0) break;  /* EOF */
+
+            if (tx_ch) {
+                ssize_t pushed = iio_channel_write(tx_ch, buf, n * sizeof(int16_t));
+                if (pushed < 0) {
+                    pthread_mutex_lock(&g_tx_stats.mutex);
+                    g_tx_stats.push_failures++;
+                    pthread_mutex_unlock(&g_tx_stats.mutex);
+                } else {
+                    pthread_mutex_lock(&g_tx_stats.mutex);
+                    g_tx_stats.packets_transmitted++;
+                    g_tx_stats.bytes_pushed += (uint64_t)pushed;
+                    pthread_mutex_unlock(&g_tx_stats.mutex);
+                }
+            }
+        }
+        fclose(f);
+    } while (g_running && loop);
+
+    printf("[TX Replay] Playback complete\n");
+    return NULL;
+}
+
 /* Main */
 int main(int argc, char **argv) {
     /* Parse command-line arguments */
@@ -1760,21 +2036,34 @@ int main(int argc, char **argv) {
             mtu = MTU_JUMBO;
         } else if (strcmp(argv[i], "--mtu") == 0 && i + 1 < argc) {
             mtu = (size_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--tx-channels") == 0 && i + 1 < argc) {
+            int mask = atoi(argv[++i]);
+            pthread_mutex_lock(&g_tx_config.mutex);
+            g_tx_config.enabled_tx_mask = (uint8_t)(mask & 0x03);
+            pthread_mutex_unlock(&g_tx_config.mutex);
+        } else if (strcmp(argv[i], "--tx-freq") == 0 && i + 1 < argc) {
+            pthread_mutex_lock(&g_tx_config.mutex);
+            g_tx_config.center_freq_hz = (uint64_t)atof(argv[++i]);
+            pthread_mutex_unlock(&g_tx_config.mutex);
+        } else if (strcmp(argv[i], "--tx-gain") == 0 && i + 1 < argc) {
+            pthread_mutex_lock(&g_tx_config.mutex);
+            g_tx_config.gain_db = atof(argv[++i]);
+            pthread_mutex_unlock(&g_tx_config.mutex);
+        } else if (strcmp(argv[i], "--tx-replay") == 0 && i + 1 < argc) {
+            g_tx_replay_path = argv[++i];
+        } else if (strcmp(argv[i], "--tx-replay-loop") == 0) {
+            g_tx_replay_loop = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("Options:\n");
-            printf("  --jumbo         Use jumbo frames (MTU 9000)\n");
-            printf("  --mtu <size>    Set custom MTU size in bytes\n");
-            printf("  --help, -h      Show this help message\n");
-            printf("\nArchitecture (Phase 3 - Multicore Optimization):\n");
-            printf("  Dual-core producer/consumer with lock-free ring buffer:\n");
-            printf("  - Core 0 (DMA Reader): High-priority DMA + ring buffer push (95%% CPU)\n");
-            printf("  - Core 1 (Network): Ring buffer consume + VITA49 encode + TX (95%% CPU)\n");
-            printf("\nExpected throughput (Optimized):\n");
-            printf("  5 MSPS  -> ~80 Mbps   (2x improvement)\n");
-            printf("  10 MSPS -> ~160 Mbps  (2x improvement)\n");
-            printf("  20 MSPS -> ~320 Mbps  (2x improvement)\n");
-            printf("  30 MSPS -> ~400 Mbps  (1.67x improvement, approaching Gigabit limit)\n");
+            printf("  --jumbo                  Use jumbo frames (MTU 9000)\n");
+            printf("  --mtu <size>             Set custom MTU size in bytes\n");
+            printf("  --tx-channels <mask>     Enable TX (1=TX0, 2=TX1, 3=both)\n");
+            printf("  --tx-freq <hz>           TX LO frequency in Hz\n");
+            printf("  --tx-gain <db>           TX gain (negative = attenuation)\n");
+            printf("  --tx-replay <file>       Replay raw int16 IQ file to TX\n");
+            printf("  --tx-replay-loop         Loop TX replay file\n");
+            printf("  --help, -h               Show this help message\n");
             return 0;
         }
     }
@@ -1869,6 +2158,28 @@ int main(int argc, char **argv) {
     pthread_create(&dma_tid, NULL, dma_reader_thread, ctx);
     pthread_create(&network_tid, NULL, network_thread, &net_args);
 
+    /* Launch TX thread(s) if TX channels are enabled */
+    pthread_t tx_tid = 0;
+    struct iio_device *tx_dev = NULL;
+    uint8_t tx_mask;
+    pthread_mutex_lock(&g_tx_config.mutex);
+    tx_mask = g_tx_config.enabled_tx_mask;
+    pthread_mutex_unlock(&g_tx_config.mutex);
+
+    if (tx_mask != 0) {
+        if (configure_tx(ctx, &tx_dev) == 0 && tx_dev != NULL) {
+            if (g_tx_replay_path) {
+                pthread_create(&tx_tid, NULL, tx_replay_thread, tx_dev);
+                printf("[Main] TX replay thread started: %s\n", g_tx_replay_path);
+            } else {
+                pthread_create(&tx_tid, NULL, tx_thread, tx_dev);
+                printf("[Main] TX UDP thread started on port %d\n", TX_DATA_PORT);
+            }
+        } else {
+            fprintf(stderr, "[Main] WARNING: TX configuration failed — TX disabled\n");
+        }
+    }
+
     /* Monitor loop - simple stats every 5 seconds */
     uint64_t last_packets = 0;
     uint64_t last_bytes = 0;
@@ -1911,6 +2222,7 @@ int main(int argc, char **argv) {
     /* Cleanup */
     pthread_join(dma_tid, NULL);
     pthread_join(network_tid, NULL);
+    if (tx_tid) pthread_join(tx_tid, NULL);
 
     /* Free burst buffers */
     burst_buffer_free(&g_burst_rx0);

@@ -37,7 +37,7 @@ _Static_assert((RING_BUFFER_CAPACITY & (RING_BUFFER_CAPACITY - 1)) == 0,
 typedef struct {
     int16_t* data;              /* Pointer to I/Q samples (interleaved) */
     size_t sample_count;        /* Number of I/Q pairs in this buffer */
-    uint64_t timestamp_us;      /* Timestamp when DMA buffer was filled */
+    uint64_t timestamp_ns;      /* Timestamp when DMA buffer was filled (nanoseconds, GPS-disciplined) */
     uint32_t sequence_num;      /* Monotonically increasing sequence number */
     uint32_t buffer_id;         /* Buffer pool index (for debugging) */
 } iq_buffer_entry_t;
@@ -79,7 +79,7 @@ static inline void ring_buffer_init(lock_free_ring_buffer_t* rb) {
     for (size_t i = 0; i < RING_BUFFER_CAPACITY; i++) {
         rb->entries[i].data = rb->sample_pool[i];
         rb->entries[i].sample_count = 0;
-        rb->entries[i].timestamp_us = 0;
+        rb->entries[i].timestamp_ns = 0;
         rb->entries[i].sequence_num = 0;
         rb->entries[i].buffer_id = i;
     }

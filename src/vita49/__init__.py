@@ -23,6 +23,11 @@ from .packets import (
     VRTSignalDataPacket,
     ContextIndicatorField,
     VRTContextPacket,
+    # Epoch helpers
+    EPOCH_CLASS_OUI,
+    EPOCH_PACKET_CLASS_CODE,
+    make_epoch_class_id,
+    class_id_epoch,
 )
 
 from .stream_server import (
@@ -37,6 +42,7 @@ from .stream_server import (
     SimulatedSDRInterface,
     VITA49StreamServer,
     VITA49StreamClient,
+    VITA49TxServer,
 )
 
 # Note: config_client is typically used as a script, not imported
